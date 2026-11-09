@@ -7,13 +7,24 @@
 #    板端可用的只有 `× ● ■ ▶ ← → ↑ ↓` —— 下面的输出只用这些。
 
 # ---------------------------------------------------------------------------
+# 家目录
+#
+# 脚本**不自行提权**，也不假设自己是被谁提权跑的 —— 家目录就是当前进程的
+# $HOME。谁跑安装器，wdn 命令就装给谁；缺权限时脚本只把要执行的命令打出来，
+# 由操作员自己以 root 身份跑。
+# ---------------------------------------------------------------------------
+wardner_target_home() {
+    printf '%s\n' "$HOME"
+}
+
+# ---------------------------------------------------------------------------
 # 配置（都可用环境变量覆盖，方便测试与定制）
 #
 # WARDNER_ORG / WARDNER_REPO_NAME 由 install.sh 的 bootstrap 阶段**推断**
 # 出来（从脚本自身的来源 URL 反推，见 lib/urls.sh）—— 硬编码组织名的话，
 # 换个组织 / 换个 fork 就得改代码。这里只是兜底默认值。
 # ---------------------------------------------------------------------------
-: "${WARDNER_HOME:=$HOME/.wardner}"                 # 安装根目录
+: "${WARDNER_HOME:=$(wardner_target_home)/.wardner}"   # 安装根目录
 : "${WARDNER_ORG:=rockchip-wardner}"                # GitHub 组织（由来源 URL 推断）
 : "${WARDNER_REPO_NAME:=wardner}"                   # 本仓名（由来源 URL 推断）
 : "${WARDNER_REPO_URL:=https://github.com/$WARDNER_ORG/$WARDNER_REPO_NAME.git}"
@@ -138,3 +149,65 @@ read_packages() {
         printf '%s %s\n' "$pkg" "$repo"
     done < "$WARDNER_PACKAGES_CONF"
 }
+
+# ---------------------------------------------------------------------------
+# wdn 命令：装到 PATH + 写进 ~/.bashrc
+#
+# 「让当前用户直接用 wdn」要两件事：
+#   1. 命令本身在 PATH 上 —— 放两处：
+#        $WARDNER_HOME/<repo>/bin/wdn   （真身，bashrc 加进 PATH）
+#        ~/.local/bin/wdn               （symlink，给不读 bashrc 的场景兜底）
+#   2. 环境的来源写进 ~/.bashrc —— 托管块形式，带起止标记，重复安装会
+#      **替换**旧块而不是追加两份。
+#
+# 托管块而不是裸的一行 PATH：用户自己的 ~/.bashrc 会被后续的安装反复改，
+# 没有标记就没法安全地改回来。
+# ---------------------------------------------------------------------------
+WARDNER_BASHRC_BEGIN="# >>> wardner (wdn) >>>"
+WARDNER_BASHRC_END="# <<< wardner (wdn) <<<"
+
+# 写（或替换）~/.bashrc 里的托管块。幂等。
+wardner_write_bashrc() {
+    local rc="$1" home="$2" bindir="$3"
+    local begin="$WARDNER_BASHRC_BEGIN" end="$WARDNER_BASHRC_END"
+
+    if [ -z "$rc" ] || [ -z "$bindir" ]; then
+        return 1
+    fi
+
+    mkdir -p "$(dirname "$rc")"
+    [ -f "$rc" ] || : > "$rc"
+
+    # 只在**两个标记都在**的时候才删旧块 —— 只剩 begin 标记说明上次写坏了，
+    # 这时宁可不动，也别把用户 bashrc 后面的内容一起吃掉。
+    if grep -qF "$begin" "$rc" && grep -qF "$end" "$rc"; then
+        local tmp
+        tmp="$(mktemp)"
+        if awk -v b="$begin" -v e="$end" '
+            index($0, b) { inblk = 1; next }
+            index($0, e) { inblk = 0; next }
+            !inblk { print }
+        ' "$rc" > "$tmp"; then
+            mv "$tmp" "$rc"
+        else
+            rm -f "$tmp"
+            warn "改写 ~/.bashrc 失败 —— 保留原样，请手工加入 PATH： $bindir"
+            return 1
+        fi
+    fi
+
+    cat >> "$rc" <<EOF
+
+$begin
+# 由 wardner install.sh 写入 —— 让当前用户直接用 wdn 命令。
+# 删掉这一段不影响安装，只是 wdn 得用全路径调。
+export WARDNER_HOME="$home"
+case ":\$PATH:" in
+  *":$bindir:"*) ;;
+  *) export PATH="$bindir:\$PATH" ;;
+esac
+$end
+EOF
+    return 0
+}
+

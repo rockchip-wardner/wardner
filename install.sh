@@ -34,7 +34,13 @@ set -euo pipefail
 # WARDNER_BOOTSTRAPPED 是防递归哨兵 —— 克隆版带着它跑，就不会再次 bootstrap。
 # ---------------------------------------------------------------------------
 if [ -z "${WARDNER_BOOTSTRAPPED:-}" ]; then
-    : "${WARDNER_HOME:=$HOME/.wardner}"
+    # 安装根目录默认放在当前用户的家目录下。
+    #
+    # 脚本**不自行提权** —— 缺权限时只把命令打出来让操作员自己以 root 身份
+    # 跑。所以「谁跑安装器，wdn 命令就装给谁」：家目录就是 $HOME。
+    if [ -z "${WARDNER_HOME:-}" ]; then
+        WARDNER_HOME="$HOME/.wardner"
+    fi
     WARDNER_HOME="${WARDNER_HOME%/}"
     : "${WARDNER_GIT_RETRY:=5}"
     : "${WARDNER_RETRY_DELAY:=5}"
@@ -156,7 +162,7 @@ preflight() {
     # Debian/Ubuntu 的 python3-venv 是单独的包，缺了 `python3 -m venv` 会报
     # "ensurepip is not available"。提前说清楚，别让用户对着报错猜。
     if ! "$WARDNER_PYTHON" -c 'import ensurepip, venv' >/dev/null 2>&1; then
-        die "缺 venv 模块（Debian/Ubuntu: sudo apt install python3-venv）"
+        die "缺 venv 模块（Debian/Ubuntu: 以 root 身份执行 apt-get install -y python3-venv）"
     fi
     ok "venv 模块可用"
 
@@ -213,7 +219,7 @@ create_venv() {
     else
         mkdir -p "$(dirname "$WARDNER_VENV")"
         "$WARDNER_PYTHON" -m venv "$WARDNER_VENV" \
-            || die "创建 venv 失败（Debian/Ubuntu: sudo apt install python3-venv）"
+            || die "创建 venv 失败（Debian/Ubuntu: 以 root 身份执行 apt-get install -y python3-venv）"
         ok "已创建 $WARDNER_VENV"
     fi
     "$WARDNER_VENV/bin/python" -m pip install --quiet --upgrade pip setuptools wheel
@@ -276,19 +282,15 @@ ensure_build_deps() {
         return 0
     fi
 
-    if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
-        log "用 sudo 安装 apt 依赖： ${need[*]}"
-        sudo apt-get update -qq >/dev/null 2>&1 || true
-        sudo apt-get install -y "${need[@]}" >/dev/null 2>&1 \
-            || warn "apt 安装失败，继续往下走"
-        ok "编译依赖处理完毕"
-        return 0
-    fi
-
+    # 非 root：脚本**不自行提权** —— 只把要执行的命令原样打出来，由操作员
+    # 自己在 root 身份下跑。缺这几个包只影响 wdndds 的 .so，其余链路不依赖
+    # 它，所以不致命。
     warn "缺编译依赖： ${need[*]}"
-    warn "wdndds 的 .so 可能编不出来（算力页会报「功能未启用」）。装完后补："
-    warn "  sudo apt-get install -y ${need[*]}"
-    warn "  bash $WARDNER_HOST_DIR/update_rkwhl.sh   # 重跑即可补编"
+    warn "wdndds 的 .so 可能编不出来（算力页会报「功能未启用」）。"
+    warn "请以 root 身份执行下面三条，然后重跑本脚本补编："
+    warn "  apt-get update"
+    warn "  apt-get install -y ${need[*]}"
+    warn "  bash $WARDNER_HOST_DIR/update_rkwhl.sh"
     return 0   # 不致命：其它链路不依赖它
 }
 
@@ -390,6 +392,57 @@ PY
     fi
 }
 
+# ---------------------------------------------------------------------------
+# Phase 8: 装 wdn 命令
+#
+# wdn = wardner 命令行入口：bin/wdn（bash 启动器）→ 用 .venv 的 python 跑
+# cli/wdn.py。第一个子命令是 `wdn update` —— 把所有已下载的仓更新到 GitHub
+# 最新并重新同步 venv。
+#
+# 装两处：
+#   * $WARDNER_HOME/<repo>/bin/wdn   真身；PATH 由 ~/.bashrc 的托管块给出
+#   * ~/.local/bin/wdn               symlink，给不读 bashrc 的场景兜底
+#     （debian 默认 ~/.profile 会把 ~/.local/bin 加进 PATH）
+#
+# 再把 WARDNER_HOME + PATH 写进 ~/.bashrc 的**托管块**（带起止标记），
+# 重复安装是替换旧块而不是追加两份。
+# ---------------------------------------------------------------------------
+install_wdn_command() {
+    step "安装 wdn 命令"
+
+    local bindir="$WARDNER_REPO_DIR/bin"
+    local cmd="$bindir/wdn"
+    if [ ! -f "$cmd" ]; then
+        warn "找不到 $cmd —— 跳过 wdn 安装"
+        return 0
+    fi
+    chmod +x "$cmd" 2>/dev/null || true
+
+    local target_home
+    target_home="$(wardner_target_home)"
+
+    # ~/.local/bin 的软链
+    local local_bin="$target_home/.local/bin"
+    if mkdir -p "$local_bin" 2>/dev/null; then
+        if ln -sf "$cmd" "$local_bin/wdn" 2>/dev/null; then
+            ok "软链： $local_bin/wdn → $cmd"
+        else
+            warn "建软链失败（不影响使用，bashrc 里已加 PATH）"
+        fi
+    else
+        warn "建不了 $local_bin（不影响使用，bashrc 里已加 PATH）"
+    fi
+
+    # ~/.bashrc 托管块
+    local rc="$target_home/.bashrc"
+    if wardner_write_bashrc "$rc" "$WARDNER_HOME" "$bindir"; then
+        ok "已写入 $rc"
+    else
+        warn "写 $rc 失败 —— 手工加这一行也能用："
+        warn "  export PATH=\"$bindir:\$PATH\""
+    fi
+}
+
 report() {
     cat >&2 <<EOF
 
@@ -405,10 +458,18 @@ $(printf '%s' "$C_GRN")安装完成。$(printf '%s' "$C_RST")
   cd $WARDNER_HOST_DIR
   .venv/bin/python run.py          # 打开 http://<板子IP>:8000/
 
+wdn 命令（已装进 PATH）：
+
+  wdn update                       # 把所有仓更新到 GitHub 最新并重新同步 venv
+  wdn status                       # 看各仓的 commit / remote 和 venv 状态
+
+  ※ 当前终端还没生效 —— 新开一个终端，或执行： source ~/.bashrc
+
 更新（拉最新 + 重装）：
 
   $WARDNER_REPO_DIR/install.sh
   # 或： $WARDNER_REPO_DIR/update.sh
+  # 或： wdn update
 
 EOF
 }
@@ -421,6 +482,7 @@ main() {
     ensure_build_deps
     install_packages
     verify
+    install_wdn_command
     report
 }
 

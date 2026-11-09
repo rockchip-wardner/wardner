@@ -26,7 +26,9 @@ curl -fsSL https://raw.githubusercontent.com/rockchip-wardner/wardner/master/ins
 ~/.wardner/
 ├── wardner/                    本仓（安装器自身）
 │   ├── install.sh
-│   └── update.sh
+│   ├── update.sh
+│   ├── bin/wdn                 wdn 命令入口（bash 启动器）
+│   └── cli/wdn.py              wdn 的真正实现（用 .venv 的 python 跑）
 └── wdnwebui/                   宿主应用（FastAPI 服务 + 卡片宿主）
     ├── app/  run.py  ...
     ├── requirements.txt
@@ -53,6 +55,12 @@ cd ~/.wardner/wdnwebui
 更新：
 
 ```bash
+wdn update                     # 推荐：更新所有仓 + 重新同步 venv
+```
+
+也可以用脚本：
+
+```bash
 ~/.wardner/wardner/update.sh
 ```
 
@@ -69,6 +77,7 @@ cd ~/.wardner/wdnwebui
 | 编译依赖 | cmake / build-essential / patchelf / libfoonathan-memory-dev（缺了会提示补装命令） |
 | 安装校验 | 交给宿主仓的 `update_rkwhl.sh`（见下） |
 | 冒烟 | `import wdnav/wdnai/wdndds/wdnhid` + 断言两个 `.so` 落地 |
+| 装 wdn | 命令挂进 PATH，并把环境写进 `~/.bashrc`（见下） |
 
 **安装与校验没有在本仓重写** —— 直接调用宿主仓里的
 [`update_rkwhl.sh`](https://github.com/rockchip-wardner/wdnwebui/blob/master/update_rkwhl.sh)。
@@ -84,6 +93,66 @@ cd ~/.wardner/wdnwebui
 - **审计各 SDK 自己声明的依赖** —— SDK 是 `--no-deps` 装的，声明的依赖不会自己
   进 venv，而故障现场离原因很远（缺 v4l2 → HDMI-IN 端点 503；缺 tokenizers →
   算力页「模型启动失败」）
+
+---
+
+## `wdn` 命令
+
+装完就有 —— PATH 已经写进 `~/.bashrc`，当前用户直接用：
+
+```bash
+wdn update      # 把所有已下载的仓更新到 GitHub 最新，并重新同步 venv
+wdn status      # 看各仓的 commit / remote 和 venv 状态
+wdn version     # 版本号
+```
+
+### `wdn update` 做三件事
+
+1. **对齐 remote 到 GitHub。** 各仓的 remote 可能指着内网镜像，改回 GitHub。
+   分支跟踪关系只在「当前跟踪的 remote 不指向 GitHub」时才动 —— 跟踪关系
+   同时也是你的推送路径，擅自改会让 `git push` 悄悄改道。想完全不动 remote
+   就加 `--keep-remotes`。
+2. **拉最新代码。** `wardner`（安装器自己）、`wdnwebui`（宿主）、8 个 SDK /
+   插件包，全部快进到 GitHub 的最新。
+3. **重新同步 venv。** 交给宿主仓的 `update_rkwhl.sh`：HEAD 变了就卸载重装，
+   并重编 `wdndds` / `wdnav` 的 `.so`、复核卡片注册、审计依赖。
+
+> ⚠️ **顺序不能反。** 8 个 SDK 包的「pull + 判断要不要重装」必须由
+> `update_rkwhl.sh` 自己来做 —— 它靠 **pull 前后的 HEAD 对比**判断要不要
+> 重装。如果 `wdn` 先把代码拉到最新，`update_rkwhl.sh` 就会看到「HEAD 没变」
+> 而跳过重装，`.so` 不会重新编（源码是新的、`.so` 还是旧的）。
+
+`wdn` 用的是 **venv 里的 python**（`~/.wardner/wdnwebui/.venv/bin/python`），
+所以它能直接 import SDK 做健康检查 —— 更新完会自动验证 `wdnav` / `wdnai` /
+`wdndds` / `wdnhid` 四个包是不是真能 import。
+
+服务还在跑旧代码的话，更新完重启它：
+
+```bash
+cd ~/.wardner/wdnwebui && .venv/bin/python run.py
+```
+
+> 改了 `~/.bashrc` 之后，**当前**终端还没生效 —— 新开一个终端，或
+> `source ~/.bashrc`。
+
+---
+
+## 安装器不自行提权
+
+脚本里**没有任何提权命令**。缺系统依赖（比如编译 `wdndds` 的 `.so` 要
+cmake / build-essential / patchelf / foonathan 头文件）时，它只把要执行的
+命令原样打出来，由你自己以 root 身份跑：
+
+```
+× 缺编译依赖： cmake build-essential patchelf libfoonathan-memory-dev
+× wdndds 的 .so 可能编不出来（算力页会报「功能未启用」）。
+× 请以 root 身份执行下面三条，然后重跑本脚本补编：
+×   apt-get update
+×   apt-get install -y cmake build-essential patchelf libfoonathan-memory-dev
+×   bash ~/.wardner/wdnwebui/update_rkwhl.sh
+```
+
+同理，`wdn` 命令也是装给**跑安装器的那个人**（家目录就是 `$HOME`）。
 
 ---
 
@@ -144,8 +213,10 @@ WARDNER_ORG=your-org ~/.wardner/wardner/install.sh
 | `WARDNER_PKG_BASE` | `git+https://github.com/<推断出的组织>` | SDK / 插件包来源前缀 |
 | `WARDNER_PYTHON` | `python3` | 用哪个 python 建 venv |
 | `WARDNER_BRANCH` | `master` | 拉哪个分支 |
-| `WARDNER_GIT_RETRY` | `3` | clone / pull 重试次数 |
+| `WARDNER_GIT_RETRY` | `5` | clone / pull 重试次数 |
 | `WARDNER_RETRY_DELAY` | `5` | 重试间隔（秒） |
+| `WARDNER_GIT_LOW_SPEED_LIMIT` | `1` | git 低速阈值（字节/秒）—— 低于它就算断 |
+| `WARDNER_GIT_LOW_SPEED_TIME` | `30` | 触发低速中断的秒数（git 默认没有连接超时，TCP 失败要等 135s） |
 
 ---
 
@@ -165,10 +236,11 @@ WARDNER_ORG=your-org ~/.wardner/wardner/install.sh
 cd ~/.wardner/wdnwebui && .venv/bin/python run.py
 ```
 
-**算力页报「功能未启用」。** 说明 `wdndds` 的 `.so` 没编出来：
+**算力页报「功能未启用」。** 说明 `wdndds` 的 `.so` 没编出来。安装器不自行
+提权，下面两条**以 root 身份**执行：
 
 ```bash
-sudo apt-get install -y cmake build-essential patchelf libfoonathan-memory-dev
+apt-get install -y cmake build-essential patchelf libfoonathan-memory-dev
 bash ~/.wardner/wdnwebui/update_rkwhl.sh
 ```
 
@@ -180,7 +252,7 @@ cd ~/.wardner/wdnwebui
 .venv/bin/python scripts/check_sdk_deps.py    # 全量依赖审计
 ```
 
-**克隆超时。** GitHub 在部分网络下不稳。安装器自带重试（3 次，间隔 5s），
+**克隆超时。** GitHub 在部分网络下不稳。安装器自带重试（5 次，间隔 5s），
 一般能扛过去。仍不行就手动分步来，每一步都能看清卡在哪：
 
 ```bash

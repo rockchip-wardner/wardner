@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# wdn —— wardner 命令行入口
+#
+#   wdn update     把所有已下载的仓更新到 GitHub 最新，并重新同步 venv
+#   wdn status     看各仓的本地 commit / remote 和 venv 状态
+#   wdn version    版本号
+#
+# 分两层：
+#   * 本文件（bash）只负责「找到自己」+「找到 venv 的 python」，然后 exec 出去；
+#   * 真正的 CLI 在 ../cli/wdn.py，用 **venv 的 python** 跑 —— 这样它天然能
+#     import SDK 做健康检查，也能确认更新前后的环境是同一套解释器。
+#
+# ⚠️ 本文件会被 symlink 进 ~/.local/bin，所以必须解析 symlink 链拿到真实
+#    位置 —— 否则 lib/ 和 cli/ 的相对路径全错。
+
+set -euo pipefail
+
+# --- 解析 symlink 链，拿到真实路径 ---
+_self="$0"
+while [ -L "$_self" ]; do
+    _dir="$(cd -P "$(dirname "$_self")" && pwd)"
+    _self="$(readlink "$_self")"
+    case "$_self" in
+        /*) ;;
+        *) _self="$_dir/$_self" ;;
+    esac
+done
+BIN_DIR="$(cd -P "$(dirname "$_self")" && pwd)"
+ROOT="$(cd -P "$BIN_DIR/.." && pwd)"
+
+# --- 定位安装根目录 ---
+#
+# WARDNER_HOME 没设就从自身位置反推：<home>/wardner/bin/wdn → <home>
+# 注意是「本仓所在的父目录」，不是 ~/.wardner —— 装到别处时也对。
+if [ -z "${WARDNER_HOME:-}" ]; then
+    WARDNER_HOME="$(cd -P "$ROOT/.." && pwd)"
+fi
+export WARDNER_HOME
+
+CLI="$ROOT/cli/wdn.py"
+VENV_PY="$WARDNER_HOME/wdnwebui/.venv/bin/python"
+
+if [ ! -f "$CLI" ]; then
+    printf '[fail] 找不到 CLI： %s\n' "$CLI" >&2
+    exit 1
+fi
+
+if [ ! -x "$VENV_PY" ]; then
+    printf '[fail] 还没装好 —— 找不到 venv 的 python\n' >&2
+    printf '       %s\n' "$VENV_PY" >&2
+    printf '       先跑一遍安装： bash %s/install.sh\n' "$ROOT" >&2
+    exit 1
+fi
+
+exec "$VENV_PY" "$CLI" "$@"
