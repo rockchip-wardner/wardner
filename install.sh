@@ -343,7 +343,17 @@ install_packages() {
 verify() {
     step "冒烟验证"
 
-    "$WARDNER_VENV/bin/python" - <<'PY' || warn "SDK import 检查未全过"
+    # 硬断言：4 个 SDK 必须真的 import 得起来。
+    #
+    # ⚠️ 这里必须硬失败，不能只 warn —— update_rkwhl.sh 的 verify_outputs 对
+    #    wdnai / wdnhid 直接 `return 0`（纯 Python，没有 .so 可断言），而
+    #    audit_sdk_deps 只查「SDK 声明的依赖能不能用」，不查包自身能不能
+    #    import。于是 .pth / editable 装歪了这类故障会**穿过所有门禁**，
+    #    最后还打印一句「安装完成」—— 而 wdnai 是所有 LLM/VLM 能力的底座。
+    #
+    #    wdndds / wdnav 另有 .so 落地断言兜着，4 个插件包另有卡片注册校验
+    #    兜着（find_spec 失败即 BAD）。wdnai / wdnhid 缺的正是这一道。
+    if ! "$WARDNER_VENV/bin/python" - <<'PY'
 import importlib, sys
 mods = ["wdnav", "wdnai", "wdndds", "wdnhid"]
 bad = []
@@ -356,6 +366,13 @@ for m in mods:
         print(f"  import {m}: FAILED ({exc})")
 sys.exit(1 if bad else 0)
 PY
+    then
+        die "SDK import 检查未通过 —— 上面失败的包没装好。
+     常见原因：editable 安装的 .pth 指向了不存在的路径，或某个包的
+     clone/pull 中途失败只装了一半。
+     修复：删掉对应包目录后重跑本脚本（会重新 clone）：
+       rm -rf $WARDNER_VENV_SRC/<包名>"
+    fi
 
     local so="$WARDNER_VENV_SRC/wdndds/src/wdndds/dds/_native/libwdndds_cshim.so"
     if [ -f "$so" ]; then
