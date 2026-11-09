@@ -52,7 +52,7 @@ need_cmd() {
 }
 
 # ---------------------------------------------------------------------------
-# git 重试
+# git 重试 + 协议回退
 #
 # 一键安装最怕的就是「网络抖一下，整套装失败」：GitHub 在部分网络下会
 # GnuTLS recv error / connection reset / RPC failed，clone 到一半断掉。
@@ -60,9 +60,16 @@ need_cmd() {
 #
 # 永久性失败（本地与远端分叉）重试也没用，但重试次数少、间隔短，
 # 代价可以接受 —— 真正报错的信息在最后一次尝试里是完整可见的。
+#
+# 协议回退：HTTPS 先试，不通再试 SSH。实测有些网络对 github.com 的
+# 443 拥塞/限速，而 22 端口反而通畅（反过来也有）。两条路都试一遍，
+# 比让用户自己猜「到底是 443 还是 22 被挡了」省事。
+#
+#   WARDNER_GIT_PROTOCOL=https|ssh   强制只走某一条
 # ---------------------------------------------------------------------------
 : "${WARDNER_GIT_RETRY:=3}"
 : "${WARDNER_RETRY_DELAY:=5}"
+: "${WARDNER_GIT_PROTOCOL:=auto}"     # auto | https | ssh
 
 git_retry() {
     local label="$1"; shift
@@ -80,11 +87,53 @@ git_retry() {
     done
 }
 
+# 该仓库的 clone 地址。$1 = 仓库名，$2 = https|ssh
+repo_url() {
+    local name="$1" proto="$2"
+    case "$proto" in
+        ssh)  printf 'git@github.com:%s/%s.git' "$WARDNER_ORG" "$name" ;;
+        *)    printf 'https://github.com/%s/%s.git' "$WARDNER_ORG" "$name" ;;
+    esac
+}
+
+# clone 一个仓库：先试首选协议，不通换另一条协议再来一遍。
+# $1 = 目标目录  $2 = 仓库名
+clone_repo() {
+    local dir="$1" name="$2"
+    local first second
+    case "$WARDNER_GIT_PROTOCOL" in
+        ssh)  first=ssh;  second=https ;;
+        https) first=https; second=ssh ;;
+        *)    first=https; second=ssh ;;
+    esac
+
+    local proto
+    for proto in "$first" "$second"; do
+        local url; url="$(repo_url "$name" "$proto")"
+        if [ "$proto" = "ssh" ]; then
+            # BatchMode=yes：没配 SSH key 时立刻失败，而不是卡在密码提示上。
+            # accept-new：首次连 github.com 不该问 "Are you sure you want to
+            # continue connecting?" —— 那是交互式提示，会把安装脚本挂死。
+            if git_retry "git clone $name (ssh)" \
+                env GIT_SSH_COMMAND="ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20" \
+                git clone --branch "$WARDNER_BRANCH" "$url" "$dir"; then
+                return 0
+            fi
+        elif git_retry "git clone $name ($proto)" \
+            git clone --branch "$WARDNER_BRANCH" "$url" "$dir"; then
+            return 0
+        fi
+        [ "$proto" = "$second" ] && break
+        warn "$name 的 $first 协议不通，换 $second 再试"
+        rm -rf "$dir"
+    done
+    return 1
+}
+
 # 克隆或快进一个仓库。已存在则 pull --ff-only（本地有改动 / 分叉时不硬来）。
 # $1 = 目标目录  $2 = GitHub 仓库名
 fetch_repo() {
     local dir="$1" name="$2"
-    local url="https://github.com/$WARDNER_ORG/$name.git"
 
     if [ -d "$dir/.git" ]; then
         log "更新 $name"
@@ -99,8 +148,8 @@ fetch_repo() {
     log "克隆 $name"
     mkdir -p "$(dirname "$dir")"
     rm -rf "$dir"
-    if ! git_retry "git clone $name" git clone --branch "$WARDNER_BRANCH" "$url" "$dir"; then
-        die "克隆 $name 失败： $url"
+    if ! clone_repo "$dir" "$name"; then
+        die "克隆 $name 失败（https 与 ssh 都试过了）"
     fi
 }
 
