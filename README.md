@@ -154,11 +154,16 @@ cd ~/.wardner/wdnwebui
 .venv/bin/python scripts/check_sdk_deps.py    # 全量依赖审计
 ```
 
-**克隆超时。** GitHub 在部分网络下不稳，可以换 SSH：
+**克隆超时。** GitHub 在部分网络下不稳。安装器自带重试（3 次，间隔 5s），
+一般能扛过去。仍不行就手动分步来，每一步都能看清卡在哪：
 
 ```bash
-git config --global url."git@github.com:".insteadOf "https://github.com/"
+git clone https://github.com/rockchip-wardner/wdnwebui.git ~/.wardner/wdnwebui
+git clone https://github.com/rockchip-wardner/wdnav.git ~/.wardner/wdnwebui/.venv/src/wdnav
 ```
+
+> 全程走 **HTTPS 匿名 clone**，不需要 GitHub 账号、不需要 SSH key ——
+> 所以没登录过的用户也能装。
 
 **装完起不来：端口 8000 被占。** 板子上如果已经有另一个 wdnwebui 实例在跑
 （比如 systemd 单元 `wdnwebui.service` 指向旧的安装路径），再从 `~/.wardner`

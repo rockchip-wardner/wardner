@@ -50,10 +50,13 @@ if [ -z "${WARDNER_BOOTSTRAPPED:-}" ]; then
     mkdir -p "$WARDNER_HOME"
 
     # clone / pull 都可能被网络抖动打断，重试几次再判失败。
-    # HTTPS 连不上就换 SSH 再试一遍（有些网络只堵 443，22 反而通畅）。
     #
-    # ⚠️ 这段在 source lib/common.sh **之前**跑（那时还不知道脚本目录），
-    #    所以用不了 common.sh 里的 clone_repo —— 重复一小段是刻意的。
+    # ⚠️ 只走 HTTPS：公网用户大多没配 GitHub SSH key，走 SSH 只会卡在
+    #    "Permission denied (publickey)" 或密码提示上。公开仓的 HTTPS
+    #    匿名 clone 才是对「没登录的人」友好的唯一路径。
+    #
+    # 这段在 source lib/common.sh **之前**跑（那时还不知道脚本目录），
+    # 所以用不了 common.sh 里的 fetch_repo —— 重复一小段是刻意的。
     _try=1
     while true; do
         if [ -d "$_repo_dir/.git" ]; then
@@ -61,23 +64,10 @@ if [ -z "${WARDNER_BOOTSTRAPPED:-}" ]; then
             _what="git pull wardner"
         else
             rm -rf "$_repo_dir"
-            if [ "$WARDNER_REPO_URL" = "git@github.com:$WARDNER_ORG/wardner.git" ]; then
-                # BatchMode=yes：没配 SSH key 时立刻失败，而不是卡在密码提示。
-                GIT_SSH_COMMAND="ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20" \
-                    git clone "$WARDNER_REPO_URL" "$_repo_dir" >/dev/null 2>&1 && break
-            else
-                git clone "$WARDNER_REPO_URL" "$_repo_dir" >/dev/null 2>&1 && break
-            fi
+            git clone "$WARDNER_REPO_URL" "$_repo_dir" >/dev/null 2>&1 && break
             _what="git clone wardner"
         fi
         if [ "$_try" -ge "$WARDNER_GIT_RETRY" ]; then
-            # HTTPS 走了几轮还不通 → 换 SSH
-            if [ "$WARDNER_REPO_URL" != "git@github.com:$WARDNER_ORG/wardner.git" ]; then
-                printf '\033[1;33m[warn]\033[0m HTTPS 不通，换 SSH 再试\n' >&2
-                WARDNER_REPO_URL="git@github.com:$WARDNER_ORG/wardner.git"
-                _try=1
-                continue
-            fi
             printf '\033[1;31m[fail]\033[0m %s 失败（已重试 %s 次）\n' "$_what" "$WARDNER_GIT_RETRY" >&2
             exit 1
         fi
