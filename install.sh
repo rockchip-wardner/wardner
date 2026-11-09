@@ -32,6 +32,8 @@ if [ -z "${WARDNER_BOOTSTRAPPED:-}" ]; then
     WARDNER_HOME="${WARDNER_HOME%/}"
     WARDNER_REPO_URL="${WARDNER_REPO_URL:-https://github.com/rockchip-wardner/wardner.git}"
     _repo_dir="$WARDNER_HOME/wardner"
+    : "${WARDNER_GIT_RETRY:=3}"
+    : "${WARDNER_RETRY_DELAY:=5}"
 
     if ! command -v git >/dev/null 2>&1; then
         printf '\033[1;31m[fail]\033[0m 缺少 git，请先安装（apt install git）\n' >&2
@@ -39,15 +41,27 @@ if [ -z "${WARDNER_BOOTSTRAPPED:-}" ]; then
     fi
 
     mkdir -p "$WARDNER_HOME"
-    if [ -d "$_repo_dir/.git" ]; then
-        git -C "$_repo_dir" pull --ff-only >/dev/null 2>&1 || true
-    else
-        rm -rf "$_repo_dir"
-        git clone "$WARDNER_REPO_URL" "$_repo_dir" >/dev/null 2>&1 || {
-            printf '\033[1;31m[fail]\033[0m 克隆 %s 失败\n' "$WARDNER_REPO_URL" >&2
+
+    # clone / pull 都可能被网络抖动打断，重试几次再判失败。
+    _try=1
+    while true; do
+        if [ -d "$_repo_dir/.git" ]; then
+            git -C "$_repo_dir" pull --ff-only >/dev/null 2>&1 && break
+            _what="git pull wardner"
+        else
+            rm -rf "$_repo_dir"
+            git clone "$WARDNER_REPO_URL" "$_repo_dir" >/dev/null 2>&1 && break
+            _what="git clone wardner"
+        fi
+        if [ "$_try" -ge "$WARDNER_GIT_RETRY" ]; then
+            printf '\033[1;31m[fail]\033[0m %s 失败（已重试 %s 次）\n' "$_what" "$WARDNER_GIT_RETRY" >&2
             exit 1
-        }
-    fi
+        fi
+        printf '\033[1;33m[warn]\033[0m %s 失败（第 %s/%s 次），%ss 后重试\n' \
+            "$_what" "$_try" "$WARDNER_GIT_RETRY" "$WARDNER_RETRY_DELAY" >&2
+        _try=$((_try + 1))
+        sleep "$WARDNER_RETRY_DELAY"
+    done
 
     export WARDNER_BOOTSTRAPPED=1
     exec bash "$_repo_dir/install.sh" "$@"

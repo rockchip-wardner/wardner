@@ -51,6 +51,35 @@ need_cmd() {
     die "缺少命令 '$c'${hint:+ —— $hint}"
 }
 
+# ---------------------------------------------------------------------------
+# git 重试
+#
+# 一键安装最怕的就是「网络抖一下，整套装失败」：GitHub 在部分网络下会
+# GnuTLS recv error / connection reset / RPC failed，clone 到一半断掉。
+# 这类失败重试一次通常就成了，所以重试几次再判死刑。
+#
+# 永久性失败（本地与远端分叉）重试也没用，但重试次数少、间隔短，
+# 代价可以接受 —— 真正报错的信息在最后一次尝试里是完整可见的。
+# ---------------------------------------------------------------------------
+: "${WARDNER_GIT_RETRY:=3}"
+: "${WARDNER_RETRY_DELAY:=5}"
+
+git_retry() {
+    local label="$1"; shift
+    local attempt=1
+    while true; do
+        if "$@"; then
+            return 0
+        fi
+        if [ "$attempt" -ge "$WARDNER_GIT_RETRY" ]; then
+            return 1
+        fi
+        warn "$label 失败（第 ${attempt}/${WARDNER_GIT_RETRY} 次），${WARDNER_RETRY_DELAY}s 后重试"
+        attempt=$((attempt + 1))
+        sleep "$WARDNER_RETRY_DELAY"
+    done
+}
+
 # 克隆或快进一个仓库。已存在则 pull --ff-only（本地有改动 / 分叉时不硬来）。
 # $1 = 目标目录  $2 = GitHub 仓库名
 fetch_repo() {
@@ -59,7 +88,7 @@ fetch_repo() {
 
     if [ -d "$dir/.git" ]; then
         log "更新 $name"
-        if ! git -C "$dir" pull --ff-only; then
+        if ! git_retry "git pull $name" git -C "$dir" pull --ff-only; then
             warn "$name 本地与远端已分叉（或有未提交改动），跳过更新"
             warn "  手工处理： git -C $dir status"
             return 1
@@ -70,7 +99,7 @@ fetch_repo() {
     log "克隆 $name"
     mkdir -p "$(dirname "$dir")"
     rm -rf "$dir"
-    if ! git clone --branch "$WARDNER_BRANCH" "$url" "$dir"; then
+    if ! git_retry "git clone $name" git clone --branch "$WARDNER_BRANCH" "$url" "$dir"; then
         die "克隆 $name 失败： $url"
     fi
 }
