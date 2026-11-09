@@ -36,16 +36,57 @@ set -euo pipefail
 if [ -z "${WARDNER_BOOTSTRAPPED:-}" ]; then
     : "${WARDNER_HOME:=$HOME/.wardner}"
     WARDNER_HOME="${WARDNER_HOME%/}"
-    : "${WARDNER_ORG:=rockchip-wardner}"
-    : "${WARDNER_REPO_URL:=https://github.com/$WARDNER_ORG/wardner.git}"
-    _repo_dir="$WARDNER_HOME/wardner"
     : "${WARDNER_GIT_RETRY:=3}"
     : "${WARDNER_RETRY_DELAY:=5}"
+    _repo_dir=""
 
     if ! command -v git >/dev/null 2>&1; then
         printf '\033[1;31m[fail]\033[0m 缺少 git，请先安装（apt install git）\n' >&2
         exit 1
     fi
+
+    # ── 推断「脚本是从哪儿取来的」──────────────────────────────────────
+    #
+    # 硬编码 org/repo 意味着换组织 / 换 fork 就得改代码。这里反过来：从
+    # 来源 URL 反推组织和仓库名 —— 安装器因此是**自描述**的。
+    #
+    # 来源优先级：
+    #   1. WARDNER_REPO_URL 环境变量（显式覆盖）
+    #   2. curl 的命令行（`curl ... | bash` 时脚本自己不知道来源，但 curl
+    #      通常还在跑，/proc/<pid>/cmdline 里带着完整 URL）
+    #   3. 内置兜底
+    #
+    # ⚠️ 这段在 source lib/*.sh **之前**跑（那时还不知道脚本目录），
+    #    所以 url 解析逻辑在这里内联了一份 —— lib/urls.sh 是同套逻辑的副本。
+    _src="${WARDNER_REPO_URL:-}"
+    if [ -z "$_src" ]; then
+        for _p in /proc/[0-9]*; do
+            _cmd="$(tr '\0' ' ' < "$_p/cmdline" 2>/dev/null)" || continue
+            case "$_cmd" in *curl*install.sh*) ;; *) continue ;; esac
+            _u="$(printf '%s\n' "$_cmd" | grep -oE 'https?://[^ ]+' | head -1)"
+            [ -n "$_u" ] && { _src="$_u"; break; }
+        done
+    fi
+    [ -z "$_src" ] && _src="https://github.com/rockchip-wardner/wardner/raw/master/install.sh"
+
+    _rest="${_src%%\?*}"
+    _rest="${_rest%/}"
+    case "$_rest" in
+        *raw.githubusercontent.com/*) _rest="${_rest#*raw.githubusercontent.com/}" ;;
+        *github.com/*)               _rest="${_rest#*github.com/}" ;;
+    esac
+    _rest="${_rest%.git}"
+    _org="${_rest%%/*}"
+    _rest="${_rest#*/}"
+    _repo="${_rest%%/*}"
+    if [ -z "$_org" ] || [ -z "$_repo" ]; then
+        _org="rockchip-wardner"; _repo="wardner"
+    fi
+    WARDNER_ORG="$_org"
+    WARDNER_REPO_NAME="$_repo"
+    export WARDNER_ORG WARDNER_REPO_NAME
+    WARDNER_REPO_URL="https://github.com/$WARDNER_ORG/$WARDNER_REPO_NAME.git"
+    _repo_dir="$WARDNER_HOME/$WARDNER_REPO_NAME"
 
     mkdir -p "$WARDNER_HOME"
 
@@ -54,18 +95,15 @@ if [ -z "${WARDNER_BOOTSTRAPPED:-}" ]; then
     # ⚠️ 只走 HTTPS：公网用户大多没配 GitHub SSH key，走 SSH 只会卡在
     #    "Permission denied (publickey)" 或密码提示上。公开仓的 HTTPS
     #    匿名 clone 才是对「没登录的人」友好的唯一路径。
-    #
-    # 这段在 source lib/common.sh **之前**跑（那时还不知道脚本目录），
-    # 所以用不了 common.sh 里的 fetch_repo —— 重复一小段是刻意的。
     _try=1
     while true; do
         if [ -d "$_repo_dir/.git" ]; then
             git -C "$_repo_dir" pull --ff-only >/dev/null 2>&1 && break
-            _what="git pull wardner"
+            _what="git pull $WARDNER_REPO_NAME"
         else
             rm -rf "$_repo_dir"
             git clone "$WARDNER_REPO_URL" "$_repo_dir" >/dev/null 2>&1 && break
-            _what="git clone wardner"
+            _what="git clone $WARDNER_REPO_NAME"
         fi
         if [ "$_try" -ge "$WARDNER_GIT_RETRY" ]; then
             printf '\033[1;31m[fail]\033[0m %s 失败（已重试 %s 次）\n' "$_what" "$WARDNER_GIT_RETRY" >&2
@@ -85,6 +123,8 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/common.sh
 . "$SCRIPT_DIR/lib/common.sh"
+# shellcheck source=lib/urls.sh
+. "$SCRIPT_DIR/lib/urls.sh"
 
 # ---------------------------------------------------------------------------
 # Phase 1: 前置检查
@@ -109,6 +149,38 @@ preflight() {
         die "缺 venv 模块（Debian/Ubuntu: sudo apt install python3-venv）"
     fi
     ok "venv 模块可用"
+
+    # ⚠️ 不要写 resolve_source() —— bash 会把「命令位置的 name()」当成函数
+    #    **定义**解析，后面的 } 就成了多余的 token，整个脚本语法报错。
+    #    函数调用一律不带括号。
+    resolve_source
+}
+
+# ---------------------------------------------------------------------------
+# 以 clone 之后的实际 remote 为准，反推组织 / 仓库名
+#
+# bootstrap 阶段是从「脚本的来源 URL」推断的，那是推断；clone 之后
+# remote 里写着的才是事实。两者不一致时以 remote 为准 —— 比如脚本是从
+# 某个 fork 拉的，那 fork 的 remote 就是权威的。
+# ---------------------------------------------------------------------------
+resolve_source() {
+    local remote org repo
+    remote="$(git -C "$WARDNER_REPO_DIR" remote get-url origin 2>/dev/null || true)"
+    [ -n "$remote" ] || return 0
+
+    read -r org repo < <(parse_github_url "$remote") || return 0
+    [ -n "${org:-}" ] && [ -n "${repo:-}" ] || return 0
+
+    if [ "$org" != "$WARDNER_ORG" ]; then
+        log "源组织： $WARDNER_ORG → $org（以 clone 的 remote 为准）"
+    fi
+    WARDNER_ORG="$org"
+    WARDNER_REPO_NAME="$repo"
+    WARDNER_REPO_DIR="$WARDNER_HOME/$WARDNER_REPO_NAME"
+    WARDNER_REPO_URL="$(github_clone_url "$org" "$repo")"
+    WARDNER_PKG_BASE="git+https://github.com/$org"
+    export WARDNER_ORG WARDNER_REPO_NAME WARDNER_REPO_URL WARDNER_PKG_BASE
+    ok "源： github.com/$org/$repo"
 }
 
 # ---------------------------------------------------------------------------

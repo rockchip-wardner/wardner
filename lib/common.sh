@@ -8,18 +8,23 @@
 
 # ---------------------------------------------------------------------------
 # 配置（都可用环境变量覆盖，方便测试与定制）
+#
+# WARDNER_ORG / WARDNER_REPO_NAME 由 install.sh 的 bootstrap 阶段**推断**
+# 出来（从脚本自身的来源 URL 反推，见 lib/urls.sh）—— 硬编码组织名的话，
+# 换个组织 / 换个 fork 就得改代码。这里只是兜底默认值。
 # ---------------------------------------------------------------------------
 : "${WARDNER_HOME:=$HOME/.wardner}"                 # 安装根目录
-: "${WARDNER_ORG:=rockchip-wardner}"                # GitHub 组织
-: "${WARDNER_REPO_URL:=https://github.com/$WARDNER_ORG/wardner.git}"
-: "${WARDNER_HOST_REPO:=wdnwebui}"                  # 宿主应用仓
+: "${WARDNER_ORG:=rockchip-wardner}"                # GitHub 组织（由来源 URL 推断）
+: "${WARDNER_REPO_NAME:=wardner}"                   # 本仓名（由来源 URL 推断）
+: "${WARDNER_REPO_URL:=https://github.com/$WARDNER_ORG/$WARDNER_REPO_NAME.git}"
+: "${WARDNER_HOST_REPO:=wdnwebui}"                  # 宿主应用仓名
 : "${WARDNER_PKG_BASE:=git+https://github.com/$WARDNER_ORG}"
 : "${WARDNER_PYTHON:=python3}"
 : "${WARDNER_BRANCH:=master}"
 
 WARDNER_HOME="${WARDNER_HOME%/}"
-WARDNER_REPO_DIR="$WARDNER_HOME/wardner"                       # 本仓
-WARDNER_HOST_DIR="$WARDNER_HOME/$WARDNER_HOST_REPO"            # 宿主应用
+WARDNER_REPO_DIR="$WARDNER_HOME/$WARDNER_REPO_NAME"              # 本仓
+WARDNER_HOST_DIR="$WARDNER_HOME/$WARDNER_HOST_REPO"               # 宿主应用
 WARDNER_VENV="$WARDNER_HOST_DIR/.venv"                         # 虚拟环境
 WARDNER_VENV_SRC="$WARDNER_VENV/src"                           # SDK / 插件包
 WARDNER_PACKAGES_CONF="${WARDNER_PACKAGES_CONF:-$SCRIPT_DIR/packages.conf}"
@@ -63,7 +68,7 @@ need_cmd() {
 #
 # ⚠️ **只走 HTTPS**，不提供 SSH 回退：公网用户大多没配 GitHub SSH key，
 #    走 SSH 只会卡在 "Permission denied (publickey)" / 密码提示上。
-#    公���仓的 HTTPS 匿名 clone 是唯一对「没登录的人」友好的路径。
+#    公开仓的 HTTPS 匿名 clone 是唯一对「没登录的人」友好的路径。
 # ---------------------------------------------------------------------------
 : "${WARDNER_GIT_RETRY:=3}"
 : "${WARDNER_RETRY_DELAY:=5}"

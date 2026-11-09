@@ -99,13 +99,36 @@ cd ~/.wardner/wdnwebui
 FastDDS 3.6 的官方预编译产物**随仓分发**（`native/lib/`），`native/bin/nodesize_dbg`
 桩也在仓里 —— 板子没有外网也能编出 `.so`。
 
-**为什么包来源是可配的。** `update_rkwhl.sh` 里 `WARDNER_PKG_BASE` 默认指向公司
-内网镜像（现场板子常常没外网）；本安装器把它设成公网 GitHub。想装内网镜像：
+**为什么包来源是可配的。** `update_rkwhl.sh` 里 `WARDNER_PKG_BASE` 指向包仓库
+的前缀，本安装器把它设成公网 GitHub（由来源 URL 推断出的组织）。如果你的板子
+在无外网的隔离网络里，用 `WARDNER_PKG_BASE` 指向你自己的镜像：
 
 ```bash
-WARDNER_PKG_BASE=git+ssh://git@10.10.10.10/wardner \
+WARDNER_PKG_BASE=git+ssh://<你的镜像>/<你的路径> \
   ~/.wardner/wardner/install.sh
 ```
+
+---
+
+## 源地址是「推断」出来的，不是写死的
+
+安装器**不硬编码组织名**。它从「自己是从哪个 URL 拉下来的」反推：
+
+1. `WARDNER_REPO_URL` / `WARDNER_ORG` 环境变量（显式覆盖）；
+2. `curl` 的命令行 —— `curl ... | bash` 时脚本本身不知道来源，但 curl 通常还在
+   跑，它的 `/proc/<pid>/cmdline` 里带着完整 URL；
+3. 内置兜底。
+
+clone 之后还会用 **remote 里写着的地址**再确认一次（推断归推断，remote 是事实）。
+
+所以从 fork 拉同一个脚本，宿主应用和 8 个 SDK / 插件包都会跟着走那个组织。
+想指定别的组织：
+
+```bash
+WARDNER_ORG=your-org ~/.wardner/wardner/install.sh
+```
+
+包清单本身（`packages.conf`）就在仓里，跟着仓走 —— 加包不用改安装器。
 
 ---
 
@@ -114,12 +137,15 @@ WARDNER_PKG_BASE=git+ssh://git@10.10.10.10/wardner \
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `WARDNER_HOME` | `~/.wardner` | 安装根目录 |
-| `WARDNER_ORG` | `rockchip-wardner` | GitHub 组织 |
-| `WARDNER_REPO_URL` | `https://github.com/rockchip-wardner/wardner.git` | 本仓地址 |
+| `WARDNER_ORG` | 由来源 URL 推断 | GitHub 组织 |
+| `WARDNER_REPO_NAME` | 由来源 URL 推断 | 本仓名 |
+| `WARDNER_REPO_URL` | 由来源 URL 推断 | 本仓地址 |
 | `WARDNER_HOST_REPO` | `wdnwebui` | 宿主应用仓名 |
-| `WARDNER_PKG_BASE` | `git+https://github.com/rockchip-wardner` | SDK / 插件包来源前缀 |
+| `WARDNER_PKG_BASE` | `git+https://github.com/<推断出的组织>` | SDK / 插件包来源前缀 |
 | `WARDNER_PYTHON` | `python3` | 用哪个 python 建 venv |
 | `WARDNER_BRANCH` | `master` | 拉哪个分支 |
+| `WARDNER_GIT_RETRY` | `3` | clone / pull 重试次数 |
+| `WARDNER_RETRY_DELAY` | `5` | 重试间隔（秒） |
 
 ---
 
