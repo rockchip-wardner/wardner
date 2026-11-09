@@ -238,12 +238,19 @@ install_packages() {
 
     # WARDNER_PKG_BASE：让 update_rkwhl.sh 的「目录不存在」兜底路径也走公网，
     # 而不是默认的内网镜像（现场板子没外网时才需要内网）。
-    (
+    if ! (
         cd "$WARDNER_HOST_DIR" || exit 1
         WARDNER_PKG_BASE="$WARDNER_PKG_BASE" \
         UPDATE_RKWHL_FORCE_REBUILD="$force" \
         bash "$script"
-    ) || die "安装失败（上面的日志里有具体原因）"
+    ); then
+        # update_rkwhl.sh 逐包驱动：某个包失败只记 warn 并继续，最后统一
+        # 汇总「以下包未更新」并 exit 1。首次安装时这意味着**有包没装上**。
+        echo "" >&2
+        die "安装未完成 —— 见上方「以下包未更新」的汇总。
+     首次安装失败最常见的是网络：clone / pip 拉 GitHub 抖了一下。
+     直接重跑本脚本即可（已装好的包会跳过）："
+    fi
 
     ok "全部包安装完成"
 }
