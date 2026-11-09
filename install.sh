@@ -36,8 +36,10 @@ set -euo pipefail
 if [ -z "${WARDNER_BOOTSTRAPPED:-}" ]; then
     : "${WARDNER_HOME:=$HOME/.wardner}"
     WARDNER_HOME="${WARDNER_HOME%/}"
-    : "${WARDNER_GIT_RETRY:=3}"
+    : "${WARDNER_GIT_RETRY:=5}"
     : "${WARDNER_RETRY_DELAY:=5}"
+    : "${WARDNER_GIT_LOW_SPEED_LIMIT:=1}"
+    : "${WARDNER_GIT_LOW_SPEED_TIME:=30}"
     _repo_dir=""
 
     if ! command -v git >/dev/null 2>&1; then
@@ -95,14 +97,22 @@ if [ -z "${WARDNER_BOOTSTRAPPED:-}" ]; then
     # ⚠️ 只走 HTTPS：公网用户大多没配 GitHub SSH key，走 SSH 只会卡在
     #    "Permission denied (publickey)" 或密码提示上。公开仓的 HTTPS
     #    匿名 clone 才是对「没登录的人」友好的唯一路径。
+    #
+    # lowSpeedLimit/lowSpeedTime：git 默认没有连接超时，TCP 层失败要等
+    # 135s 才报（实测 "Failed to connect ... after 135137 ms"）。9 个仓
+    # 的安装里，一次抖动就能拖掉十几分钟 —— 压到 30s，配合重试总耗时可控。
     _try=1
     while true; do
         if [ -d "$_repo_dir/.git" ]; then
-            git -C "$_repo_dir" pull --ff-only >/dev/null 2>&1 && break
+            git -C "$_repo_dir" -c "http.lowSpeedLimit=$WARDNER_GIT_LOW_SPEED_LIMIT" \
+                -c "http.lowSpeedTime=$WARDNER_GIT_LOW_SPEED_TIME" \
+                pull --ff-only >/dev/null 2>&1 && break
             _what="git pull $WARDNER_REPO_NAME"
         else
             rm -rf "$_repo_dir"
-            git clone "$WARDNER_REPO_URL" "$_repo_dir" >/dev/null 2>&1 && break
+            git -c "http.lowSpeedLimit=$WARDNER_GIT_LOW_SPEED_LIMIT" \
+                -c "http.lowSpeedTime=$WARDNER_GIT_LOW_SPEED_TIME" \
+                clone "$WARDNER_REPO_URL" "$_repo_dir" >/dev/null 2>&1 && break
             _what="git clone $WARDNER_REPO_NAME"
         fi
         if [ "$_try" -ge "$WARDNER_GIT_RETRY" ]; then

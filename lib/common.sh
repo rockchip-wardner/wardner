@@ -69,9 +69,22 @@ need_cmd() {
 # ⚠️ **只走 HTTPS**，不提供 SSH 回退：公网用户大多没配 GitHub SSH key，
 #    走 SSH 只会卡在 "Permission denied (publickey)" / 密码提示上。
 #    公开仓的 HTTPS 匿名 clone 是唯一对「没登录的人」友好的路径。
+#
+# lowSpeedLimit/lowSpeedTime：git 默认**没有**连接超时，TCP 层的失败要等
+# 135s 才报出来（实测 "Failed to connect ... after 135137 ms"）。这在
+# 9 个仓的安装里意味着一次抖动就要等十几分钟。设成「30 秒内不到 1 字节
+# 就 abort」把失败尝试压到 30s，配合重试总耗时可控。
 # ---------------------------------------------------------------------------
-: "${WARDNER_GIT_RETRY:=3}"
+: "${WARDNER_GIT_RETRY:=5}"
 : "${WARDNER_RETRY_DELAY:=5}"
+: "${WARDNER_GIT_LOW_SPEED_LIMIT:=1}"
+: "${WARDNER_GIT_LOW_SPEED_TIME:=30}"
+
+# git 的网络参数（放在子命令前）
+GIT_NET_OPTS=(
+    -c "http.lowSpeedLimit=$WARDNER_GIT_LOW_SPEED_LIMIT"
+    -c "http.lowSpeedTime=$WARDNER_GIT_LOW_SPEED_TIME"
+)
 
 git_retry() {
     local label="$1"; shift
@@ -97,7 +110,8 @@ fetch_repo() {
 
     if [ -d "$dir/.git" ]; then
         log "更新 $name"
-        if ! git_retry "git pull $name" git -C "$dir" pull --ff-only; then
+        if ! git_retry "git pull $name" \
+            git -C "$dir" "${GIT_NET_OPTS[@]}" pull --ff-only; then
             warn "$name 本地与远端已分叉（或有未提交改动），跳过更新"
             warn "  手工处理： git -C $dir status"
             return 1
@@ -108,7 +122,8 @@ fetch_repo() {
     log "克隆 $name"
     mkdir -p "$(dirname "$dir")"
     rm -rf "$dir"
-    if ! git_retry "git clone $name" git clone --branch "$WARDNER_BRANCH" "$url" "$dir"; then
+    if ! git_retry "git clone $name" \
+        git "${GIT_NET_OPTS[@]}" clone --branch "$WARDNER_BRANCH" "$url" "$dir"; then
         die "克隆 $name 失败： $url"
     fi
 }
