@@ -296,11 +296,6 @@ $(printf '%s' "$C_GRN")安装完成。$(printf '%s' "$C_RST")
   $WARDNER_REPO_DIR/install.sh
   # 或： $WARDNER_REPO_DIR/update.sh
 
-开机自启（可选，需要 root）：
-
-  cd $WARDNER_HOST_DIR
-  sudo ./install_autostart.sh
-
 EOF
 }
 

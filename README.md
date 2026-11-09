@@ -159,3 +159,19 @@ cd ~/.wardner/wdnwebui
 ```bash
 git config --global url."git@github.com:".insteadOf "https://github.com/"
 ```
+
+**装完起不来：端口 8000 被占。** 板子上如果已经有另一个 wdnwebui 实例在跑
+（比如 systemd 单元 `wdnwebui.service` 指向旧的安装路径），再从 `~/.wardner`
+起一个就会两个进程抢 8000。systemd 那个 `Restart=on-failure` +
+`RestartSec=5` 会每 5 秒重启一轮，而且**每轮都把 cgroup 里的 compute_worker
+一起 SIGTERM 掉** —— 症状是「worker 加载完 ~33s 后 ~9s 就死」，很容易被
+误判成 NPU 加载有问题。
+
+排查顺序：
+
+```bash
+systemctl status wdnwebui.service     # 有没有另一个实例
+ss -ltnp | grep :8000                 # 谁占着端口
+```
+
+二选一，别同时跑。
