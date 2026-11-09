@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# wdnwebui 一键安装器 —— 公共配置与工具函数
+#
+# 被 install.sh / update.sh source，**不要**直接执行。
+#
+# 板端没有 emoji / 符号字体：`🖼 ✕ ⚠ ✓ ☑ ▯ 🗑 📁` 全部渲染成豆腐块（□）。
+#    板端可用的只有 `× ● ■ ▶ ← → ↑ ↓` —— 下面的输出只用这些。
+
+# ---------------------------------------------------------------------------
+# 配置（都可用环境变量覆盖，方便测试与定制）
+# ---------------------------------------------------------------------------
+: "${WARDNER_HOME:=$HOME/.wardner}"                 # 安装根目录
+: "${WARDNER_ORG:=rockchip-wardner}"                # GitHub 组织
+: "${WARDNER_REPO_URL:=https://github.com/$WARDNER_ORG/wardner.git}"
+: "${WARDNER_HOST_REPO:=wdnwebui}"                  # 宿主应用仓
+: "${WARDNER_PKG_BASE:=git+https://github.com/$WARDNER_ORG}"
+: "${WARDNER_PYTHON:=python3}"
+: "${WARDNER_BRANCH:=master}"
+
+WARDNER_HOME="${WARDNER_HOME%/}"
+WARDNER_REPO_DIR="$WARDNER_HOME/wardner"                       # 本仓
+WARDNER_HOST_DIR="$WARDNER_HOME/$WARDNER_HOST_REPO"            # 宿主应用
+WARDNER_VENV="$WARDNER_HOST_DIR/.venv"                         # 虚拟环境
+WARDNER_VENV_SRC="$WARDNER_VENV/src"                           # SDK / 插件包
+WARDNER_PACKAGES_CONF="${WARDNER_PACKAGES_CONF:-$SCRIPT_DIR/packages.conf}"
+
+# ---------------------------------------------------------------------------
+# 输出
+# ---------------------------------------------------------------------------
+if [ -t 2 ] && [ -z "${NO_COLOR:-}" ]; then
+    C_RED=$'\033[1;31m'; C_GRN=$'\033[1;32m'; C_YEL=$'\033[1;33m'
+    C_BLU=$'\033[1;34m'; C_DIM=$'\033[2m'; C_RST=$'\033[0m'
+else
+    C_RED=""; C_GRN=""; C_YEL=""; C_BLU=""; C_DIM=""; C_RST=""
+fi
+
+log()  { printf '%s[wardner]%s %s\n' "$C_BLU" "$C_RST" "$*" >&2; }
+step() { printf '\n%s▶ %s%s\n' "$C_BLU" "$*" "$C_RST" >&2; }
+ok()   { printf '  %s●%s %s\n' "$C_GRN" "$C_RST" "$*" >&2; }
+warn() { printf '  %s×%s %s\n' "$C_YEL" "$C_RST" "$*" >&2; }
+fail() { printf '  %s×%s %s\n' "$C_RED" "$C_RST" "$*" >&2; }
+die()  { printf '\n%s[fail]%s %s\n' "$C_RED" "$C_RST" "$*" >&2; exit 1; }
+note() { printf '  %s%s%s\n' "$C_DIM" "$*" "$C_RST" >&2; }
+
+# ---------------------------------------------------------------------------
+# 工具
+# ---------------------------------------------------------------------------
+need_cmd() {
+    local c="$1" hint="${2:-}"
+    command -v "$c" >/dev/null 2>&1 && return 0
+    die "缺少命令 '$c'${hint:+ —— $hint}"
+}
+
+# 克隆或快进一个仓库。已存在则 pull --ff-only（本地有改动 / 分叉时不硬来）。
+# $1 = 目标目录  $2 = GitHub 仓库名
+fetch_repo() {
+    local dir="$1" name="$2"
+    local url="https://github.com/$WARDNER_ORG/$name.git"
+
+    if [ -d "$dir/.git" ]; then
+        log "更新 $name"
+        if ! git -C "$dir" pull --ff-only; then
+            warn "$name 本地与远端已分叉（或有未提交改动），跳过更新"
+            warn "  手工处理： git -C $dir status"
+            return 1
+        fi
+        return 0
+    fi
+
+    log "克隆 $name"
+    mkdir -p "$(dirname "$dir")"
+    rm -rf "$dir"
+    if ! git clone --branch "$WARDNER_BRANCH" "$url" "$dir"; then
+        die "克隆 $name 失败： $url"
+    fi
+}
+
+# 读 packages.conf 的每一行 → "pkg<TAB>repo"。跳过空行与 # 注释。
+read_packages() {
+    [ -f "$WARDNER_PACKAGES_CONF" ] || die "找不到包清单 $WARDNER_PACKAGES_CONF"
+    while read -r pkg repo _rest; do
+        [ -z "${pkg:-}" ] && continue
+        case "$pkg" in \#*) continue ;; esac
+        [ -z "${repo:-}" ] && continue
+        printf '%s %s\n' "$pkg" "$repo"
+    done < "$WARDNER_PACKAGES_CONF"
+}
