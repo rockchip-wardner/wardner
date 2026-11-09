@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
 # wdnwebui 一键安装器
 #
-#   curl -fsSL https://github.com/rockchip-wardner/wardner/install.sh | bash
+#   curl -fsSL https://github.com/rockchip-wardner/wardner/raw/master/install.sh | bash
+#
+# 等价的写法（同一个文件）：
+#   curl -fsSL https://raw.githubusercontent.com/rockchip-wardner/wardner/master/install.sh | bash
+#
+# ⚠️ 注意是 **/raw/master/**，不能写成 .../wardner/install.sh —— 后者是 GitHub
+#    的网页路由，不是原始文件地址（curl 会拿到 404 或一段 HTML）。
 #
 # 装到 ~/.wardner 下：
 #

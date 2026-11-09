@@ -4,8 +4,17 @@ Rockchip 平台 Web 服务（[wdnwebui](https://github.com/rockchip-wardner/wdnw
 及其 SDK / 卡片插件的一键安装脚本。
 
 ```bash
-curl -fsSL https://github.com/rockchip-wardner/wardner/install.sh | bash
+curl -fsSL https://github.com/rockchip-wardner/wardner/raw/master/install.sh | bash
 ```
+
+等价的写法（同一个文件）：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/rockchip-wardner/wardner/master/install.sh | bash
+```
+
+> 注意路径是 **`/raw/master/`**。写成 `.../wardner/install.sh` 拿到的是 GitHub 的
+> 网页路由，不是原始文件 —— curl 会 404，或者把一段 HTML 喂给 bash。
 
 一条命令把整套装到 `~/.wardner`，建好 venv、装好依赖、编好原生库。
 
