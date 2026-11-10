@@ -120,7 +120,7 @@ You can also use the script:
 | Build the dependencies | cmake / build-essential / patchelf / libfoonathan-memory-dev (if missing, it prints the install command) |
 | Install and verify | delegated to the host repo's `update_rkwhl.sh` (see below) |
 | Smoke test | `import wdnav/wdnai/wdndds/wdnhid` + assert that both `.so` files landed |
-| Install wdn | put the command on PATH and write the environment into `~/.bashrc` (see below) |
+| Install wdn | put the command on PATH and write the environment into the rc files (`~/.bashrc` **and** `~/.zshrc`, see below) |
 
 **Install and verification are not reimplemented here** — the installer calls
 [`update_rkwhl.sh`](https://github.com/rockchip-wardner/wdnwebui/blob/master/update_rkwhl.sh)
@@ -145,8 +145,9 @@ what it already knows how to install:
 
 ## The `wdn` command
 
-It exists right after the install — PATH is already written into `~/.bashrc`, the
-current user can use it directly:
+It exists right after the install — PATH is already written into the rc files of
+the shells the user uses (`~/.bashrc` **and** `~/.zshrc`), the current user can
+use it directly:
 
 ```bash
 wdn update      # update every downloaded repo to the latest on the source site, and re-sync the venv
@@ -190,8 +191,10 @@ If the service is still running the old code, restart it after the update:
 cd ~/.wardner/wdnwebui && .venv/bin/python run.py
 ```
 
-> After changing `~/.bashrc`, the **current** terminal has not picked it up yet — open
-> a new terminal, or `source ~/.bashrc`.
+> After the install, the **current** terminal has not picked the PATH up yet — open
+> a new terminal, or `source ~/.bashrc` (zsh: `source ~/.zshrc`). A board that
+> logs in with zsh never reads `~/.bashrc` — that is why both files are written.
+> `wdn doctor` reports the state of both.
 
 ---
 

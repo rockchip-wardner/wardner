@@ -111,7 +111,7 @@ wdn update                     # 推荐：更新所有仓 + 重新同步 venv
 | 编译依赖 | cmake / build-essential / patchelf / libfoonathan-memory-dev（缺了会提示补装命令） |
 | 安装校验 | 交给宿主仓的 `update_rkwhl.sh`（见下） |
 | 冒烟 | `import wdnav/wdnai/wdndds/wdnhid` + 断言两个 `.so` 落地 |
-| 装 wdn | 命令挂进 PATH，并把环境写进 `~/.bashrc`（见下） |
+| 装 wdn | 命令挂进 PATH，并把环境写进 rc 文件（`~/.bashrc` **和** `~/.zshrc`，见下） |
 
 **安装与校验没有在本仓重写** —— 直接调用宿主仓里的
 [`update_rkwhl.sh`](https://github.com/rockchip-wardner/wdnwebui/blob/master/update_rkwhl.sh)。
@@ -132,7 +132,8 @@ wdn update                     # 推荐：更新所有仓 + 重新同步 venv
 
 ## `wdn` 命令
 
-装完就有 —— PATH 已经写进 `~/.bashrc`，当前用户直接用：
+装完就有 —— PATH 已经写进用户实际用的 shell 的 rc 文件（`~/.bashrc` **和**
+`~/.zshrc`），当前用户直接用：
 
 ```bash
 wdn update      # 把所有已下载的仓更新到源站最新，并重新同步 venv
@@ -169,8 +170,9 @@ wdn version     # 版本号
 cd ~/.wardner/wdnwebui && .venv/bin/python run.py
 ```
 
-> 改了 `~/.bashrc` 之后，**当前**终端还没生效 —— 新开一个终端，或
-> `source ~/.bashrc`。
+> 装完之后，**当前**终端还没生效 —— 新开一个终端，或 `source ~/.bashrc`
+> （zsh 是 `source ~/.zshrc`）。用 zsh 登录的板子根本不会读 `~/.bashrc`，
+> 所以两个文件都会写；`wdn doctor` 会把两边的情况都报出来。
 
 ---
 

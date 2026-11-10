@@ -197,27 +197,36 @@ read_packages() {
 }
 
 # ---------------------------------------------------------------------------
-# The wdn command: put it on PATH + write it into ~/.bashrc
+# The wdn command: put it on PATH + write it into the shell rc files
 #
 # "Let the current user run wdn directly" takes two things:
 #   1. The command itself on the PATH — in two places:
-#        $WARDNER_HOME/<repo>/bin/wdn   (the real one, added to the PATH by bashrc)
-#        ~/.local/bin/wdn               (symlink, for shells that don't read bashrc)
-#   2. The environment it needs written into ~/.bashrc — as a managed block
-#      with begin/end markers, so a repeated install **replaces** the old
+#        $WARDNER_HOME/<repo>/bin/wdn   (the real one, added to the PATH by the rc)
+#        ~/.local/bin/wdn               (symlink, for shells that read neither rc)
+#   2. The environment it needs written into the shell rc files — as a managed
+#      block with begin/end markers, so a repeated install **replaces** the old
 #      block instead of appending a second copy.
 #
-# A managed block rather than a bare PATH line: the user's own ~/.bashrc gets
+# A managed block rather than a bare PATH line: the user's own rc files get
 # rewritten by every install, and without markers there is no safe way to
 # change it back.
+#
+# ⚠️ **bash AND zsh**: a board that logs in with zsh never reads ~/.bashrc,
+#    and a board that logs in with bash never reads ~/.zshrc. Writing only
+#    one of them leaves the command unusable in the other shell — the block
+#    itself is plain POSIX shell, so the same text works in both.
 # ---------------------------------------------------------------------------
-WARDNER_BASHRC_BEGIN="# >>> wardner (wdn) >>>"
-WARDNER_BASHRC_END="# <<< wardner (wdn) <<<"
+WARDNER_RC_BEGIN="# >>> wardner (wdn) >>>"
+WARDNER_RC_END="# <<< wardner (wdn) <<<"
 
-# Write (or replace) the managed block in ~/.bashrc. Idempotent.
-wardner_write_bashrc() {
+# The old names — kept so that nothing outside has to change.
+WARDNER_BASHRC_BEGIN="$WARDNER_RC_BEGIN"
+WARDNER_BASHRC_END="$WARDNER_RC_END"
+
+# Write (or replace) the managed block in an rc file. Idempotent.
+wardner_write_rc() {
     local rc="$1" home="$2" bindir="$3"
-    local begin="$WARDNER_BASHRC_BEGIN" end="$WARDNER_BASHRC_END"
+    local begin="$WARDNER_RC_BEGIN" end="$WARDNER_RC_END"
 
     if [ -z "$rc" ] || [ -z "$bindir" ]; then
         return 1
@@ -240,7 +249,7 @@ wardner_write_bashrc() {
             mv "$tmp" "$rc"
         else
             rm -f "$tmp"
-            warn "could not rewrite ~/.bashrc — left it as it is, please add the PATH manually: $bindir"
+            warn "could not rewrite $rc — left it as it is, please add the PATH manually: $bindir"
             return 1
         fi
     fi
@@ -258,4 +267,31 @@ esac
 $end
 EOF
     return 0
+}
+
+# The old name — kept so that nothing outside has to change.
+wardner_write_bashrc() {
+    wardner_write_rc "$@"
+}
+
+# The rc files of the shells the user actually uses — one per line.
+#
+# ~/.bashrc always (it is the rc of the bash that runs the installer).
+# ~/.zshrc when it exists, or when zsh is the login shell — a zsh user
+# without a ~/.zshrc would never pick the block up, so it is created then.
+wardner_shell_rcs() {
+    local home="$1"
+    printf '%s\n' "$home/.bashrc"
+    if [ -f "$home/.zshrc" ] || [ "$(basename "${SHELL:-}")" = "zsh" ]; then
+        printf '%s\n' "$home/.zshrc"
+    fi
+}
+
+# The command that makes the **current** terminal pick the block up.
+wardner_source_hint() {
+    case "$(basename "${SHELL:-}")" in
+        zsh)  printf 'source ~/.zshrc' ;;
+        bash) printf 'source ~/.bashrc' ;;
+        *)    printf 'source ~/.bashrc   # zsh: source ~/.zshrc' ;;
+    esac
 }

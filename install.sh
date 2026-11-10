@@ -666,14 +666,17 @@ PY
 #
 # Installed in two places:
 #   * $WARDNER_HOME/<repo>/bin/wdn   the real one; the PATH comes from the
-#     managed block in ~/.bashrc
+#     managed block in the rc files
 #   * ~/.local/bin/wdn               symlink, a fallback for the cases that
-#     do not read bashrc (on Debian ~/.profile adds ~/.local/bin to the
+#     do not read the rc files (on Debian ~/.profile adds ~/.local/bin to the
 #     PATH by default)
 #
-# Then WARDNER_HOME + PATH are written into the **managed block** of
-# ~/.bashrc (with begin/end markers), so a repeated install replaces the old
-# block instead of appending a second copy.
+# Then WARDNER_HOME + PATH are written into the **managed block** of the rc
+# files of the shells the user uses — ~/.bashrc **and** ~/.zshrc (with
+# begin/end markers, so a repeated install replaces the old block instead of
+# appending a second copy). Both are needed: a board that logs in with zsh
+# never reads ~/.bashrc, and one that logs in with bash never reads
+# ~/.zshrc.
 # ---------------------------------------------------------------------------
 install_wdn_command() {
     step "Installing the wdn command"
@@ -695,20 +698,26 @@ install_wdn_command() {
         if ln -sf "$cmd" "$local_bin/wdn" 2>/dev/null; then
             ok "symlink: $local_bin/wdn → $cmd"
         else
-            warn "could not create the symlink (does not affect usage, the PATH is already set in bashrc)"
+            warn "could not create the symlink (does not affect usage, the PATH is set in the rc files below)"
         fi
     else
-        warn "could not create $local_bin (does not affect usage, the PATH is already set in bashrc)"
+        warn "could not create $local_bin (does not affect usage, the PATH is set in the rc files below)"
     fi
 
-    # The managed block in ~/.bashrc
-    local rc="$target_home/.bashrc"
-    if wardner_write_bashrc "$rc" "$WARDNER_HOME" "$bindir"; then
-        ok "written to $rc"
-    else
-        warn "could not write $rc — adding this line by hand works too:"
-        warn "  export PATH=\"$bindir:\$PATH\""
-    fi
+    # The managed block in the rc files of the shells the user uses —
+    # ~/.bashrc **and** ~/.zshrc. A zsh login shell never reads ~/.bashrc,
+    # so writing only that one leaves the command unusable in zsh.
+    local rc
+    while IFS= read -r rc; do
+        if wardner_write_rc "$rc" "$WARDNER_HOME" "$bindir"; then
+            ok "written to $rc"
+        else
+            warn "could not write $rc — adding this line by hand works too:"
+            warn "  export PATH=\"$bindir:\$PATH\""
+        fi
+    done <<EOF
+$(wardner_shell_rcs "$target_home")
+EOF
 }
 
 report() {
@@ -741,7 +750,7 @@ The wdn command (already on the PATH):
   wdn update                       # update every repo to the latest on $src_label and re-sync the venv
   wdn status                       # show each repo's commit / remote and the state of the venv
 
-  Note: not active in this terminal yet — open a new terminal, or run: source ~/.bashrc
+  Note: not active in this terminal yet — open a new terminal, or run: $(wardner_source_hint)
 
 To update (pull the latest + reinstall):
 
