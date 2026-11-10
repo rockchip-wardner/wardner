@@ -1,39 +1,53 @@
 #!/usr/bin/env python3
-"""wdn —— wardner 命令行工具。
+"""wdn — the wardner command line tool.
 
-子命令
-------
-  update    把所有已下载的仓库更新到**源站**（GitHub / Gitee 镜像）的最新版本，并重新同步 venv
-  status    列出各仓的本地 commit、remote 和 venv 的就绪状态
-  version   打印版本号
+Subcommands
+-----------
+  update    update every downloaded repo to the latest revision of the
+            **source site** (GitHub / the Gitee mirror) and re-sync the venv
+  status    list the local commit, the remote and the readiness of the venv
+            for every repo
+  doctor    check the system environment: the native .so files, the SDK
+            versions, the dependency versions, the plugin registration
+  version   print the version
 
-用 **venv 的 python** 跑（见 bin/wdn）
-----------------------------------------
-CLI 本身只依赖标准库，但它跑在 `~/.wardner/wdnwebui/.venv/bin/python` 下，
-有两个好处：
+Runs with the **venv python** (see bin/wdn)
+--------------------------------------------
+The CLI itself only depends on the standard library, but it runs under
+`~/.wardner/wdnwebui/.venv/bin/python`, which has two advantages:
 
-  * 能直接 import SDK（wdnai / wdnav / …），做「装完到底能不能用」的判断；
-  * 更新完可以在同一个解释器里做冒烟验证 —— 更新前后的环境是同一套。
+  * it can import the SDKs (wdnai / wdnav / …) directly and judge whether
+    the installation is actually usable;
+  * the smoke test after an update runs in the same interpreter — the
+    environment before and after the update is the same one.
 
-「拉代码」和「装包」为什么必须分开
---------------------------------
-拉代码改的是源码树，装包改的是 .venv。editable 安装意味着纯 Python 包
-拉完即生效，但带 build hook 的包（wdndds / wdnav）**必须重装**才会重新编
-.so —— 只 pull 不重装，源码是新的、.so 还是旧的。
+Why "fetch the code" and "install the packages" have to be separate
+--------------------------------------------------------------------
+Fetching the code changes the source tree, installing the packages changes
+the .venv. An editable install means a pure Python package takes effect as
+soon as it is fetched, but a package with a build hook (wdndds / wdnav)
+**must be reinstalled** to recompile the .so — pulling without reinstalling
+leaves you with new sources and an old .so.
 
-8 个 SDK 包的「pull + 判断要不要重装」交给宿主仓里的 `update_rkwhl.sh`，
-它靠 **pull 前后的 HEAD 对比**决定要不要重装。⚠️ 顺序不能颠倒：
+The "pull + decide whether to reinstall" of the 8 SDK packages is delegated
+to `update_rkwhl.sh` in the host repo, which decides based on the **HEAD
+comparison before and after the pull**. ⚠️ The order must not be reversed:
 
-    先让 update_rkwhl.sh 自己 pull  →  它看到 HEAD 变了 → 重装 + 重编 .so
-    如果 wdn 先 pull                →  它看到 HEAD 没变 → 跳过重装 → .so 不重编
+    let update_rkwhl.sh pull first  →  it sees the HEAD changed → reinstall
+                                       + recompile the .so
+    if wdn pulls first              →  it sees the HEAD unchanged → skip the
+                                       reinstall → the .so is not recompiled
 
-所以 wdn 只负责它自己的两个仓（wardner / wdnwebui），SDK 包交给
-update_rkwhl.sh —— 不重复实现那套 HEAD 对比逻辑。
+So wdn only takes care of its own two repos (wardner / wdnwebui) and leaves
+the SDK packages to update_rkwhl.sh — that HEAD comparison logic is not
+reimplemented here.
 """
 from __future__ import annotations
 
 import argparse
 import os
+import re
+import shutil
 import subprocess
 import sys
 import time
@@ -42,10 +56,11 @@ from pathlib import Path
 VERSION = "1.0.0"
 
 # ---------------------------------------------------------------------------
-# 输出
+# Output
 #
-# 板端没有 emoji / 符号字体：🖼 ✕ ⚠ ✓ ☑ ▯ 🗑 📁 全渲染成豆腐块（□）。
-# 板端可用的只有 `× ● ■ ▶ ← → ↑ ↓` —— 下面只用这些。
+# The board has no emoji / symbol font: 🖼 ✕ ⚠ ✓ ☑ ▯ 🗑 📁 all render as tofu
+# boxes (□). The only symbols that work on the board are `× ● ■ ▶ ← → ↑ ↓`
+# — only those are used below.
 # ---------------------------------------------------------------------------
 _TTY = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
 C_RED = "\033[1;31m" if _TTY else ""
@@ -82,11 +97,12 @@ def err(*lines: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 路径
+# Paths
 # ---------------------------------------------------------------------------
 
+
 def wardner_home() -> Path:
-    """安装根目录（~/.wardner）。"""
+    """The install root (~/.wardner)."""
     env = os.environ.get("WARDNER_HOME")
     if env:
         return Path(env).expanduser().resolve()
@@ -95,12 +111,12 @@ def wardner_home() -> Path:
 
 
 def wardner_repo() -> Path:
-    """本仓（安装器自身）所在目录。"""
+    """The directory of this repo (the installer itself)."""
     return Path(__file__).resolve().parent.parent
 
 
 def host_repo() -> Path:
-    """宿主应用仓。"""
+    """The host application repo."""
     env = os.environ.get("WARDNER_HOST_REPO") or "wdnwebui"
     return wardner_home() / env
 
@@ -117,13 +133,22 @@ def venv_src() -> Path:
     return venv_dir() / "src"
 
 
+def site_packages() -> Path:
+    """The site-packages of the venv this CLI runs in."""
+    import sysconfig
+
+    return Path(sysconfig.get_paths()["purelib"])
+
+
 # ---------------------------------------------------------------------------
 # git
 #
-# GIT_TERMINAL_PROMPT=0：remote 不对时 git 会要用户名/密码，那样会**卡住**
-#   等输入。宁可立刻失败，也好过挂死。
-# lowSpeedLimit/lowSpeedTime：git 默认没有连接超时，TCP 层失败要等 135s 才报
-#   （实测 "Failed to connect ... after 135137 ms"）。压到 30s。
+# GIT_TERMINAL_PROMPT=0: when the remote is wrong git asks for a
+#   username/password, which **hangs** waiting for input. Failing
+#   immediately is better than hanging.
+# lowSpeedLimit/lowSpeedTime: git has no connect timeout by default, a
+#   TCP-level failure takes 135s to surface (observed: "Failed to connect
+#   ... after 135137 ms"). Cap it at 30s.
 # ---------------------------------------------------------------------------
 GIT_ENV = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
 GIT_NET = ["-c", "http.lowSpeedLimit=1", "-c", "http.lowSpeedTime=30"]
@@ -141,7 +166,7 @@ def _git(args: list[str], cwd: Path, timeout: int = 300):
             stdin=subprocess.DEVNULL,
         )
     except subprocess.TimeoutExpired:
-        return subprocess.CompletedProcess(args, 124, "", f"超时（>{timeout}s）")
+        return subprocess.CompletedProcess(args, 124, "", f"timed out (>{timeout}s)")
 
 
 def git_out(args: list[str], cwd: Path) -> str:
@@ -162,7 +187,8 @@ def remote_of(repo: Path) -> str:
 
 
 def list_remotes(repo: Path) -> list[tuple[str, str]]:
-    """[(remote 名, URL)]。remote 名不统一（origin / github / rk 都见过）。"""
+    """[(remote name, URL)]. The remote names are not consistent (origin /
+    github / rk have all been seen)."""
     out: list[tuple[str, str]] = []
     r = _git(["remote"], repo)
     if r.returncode != 0:
@@ -182,21 +208,23 @@ def current_branch(repo: Path) -> str:
 
 
 def tracked_remote(repo: Path, branch: str) -> str:
-    """当前分支跟踪的 remote 名（branch.<br>.remote）。"""
+    """The name of the remote tracked by the current branch
+    (branch.<br>.remote)."""
     if not branch:
         return ""
     return git_out(["config", "--get", f"branch.{branch}.remote"], repo)
 
 
 def norm_remote(url: str) -> str:
-    """把 remote URL 归一化成可比较的形式。
+    """Normalise a remote URL into a comparable form.
 
-    下列写法归一化后应当相等：
+    The following spellings have to be equal after normalisation:
         git@github.com:org/repo.git
         ssh://git@github.com/org/repo.git
         https://github.com/org/repo.git
 
-    Gitee 同样处理 —— 源站不只 GitHub 一个，归一化不能按站写死。
+    Gitee is handled the same way — the source site is not only GitHub, so
+    the normalisation must not be hardcoded per site.
     """
     u = (url or "").strip()
     if u.startswith("git+"):
@@ -216,16 +244,19 @@ def norm_remote(url: str) -> str:
 
 
 def host_of(url: str) -> str:
-    """从 remote URL 反推源站主机名，取不到返回空串。
+    """Derive the source host name from a remote URL, an empty string when
+    it cannot be derived.
 
-    不限定 github.com —— Gitee 镜像、内网 GitLab 都得认。
+    Not limited to github.com — the Gitee mirror and an intranet GitLab
+    have to be recognised as well.
     """
     parts = norm_remote(url).split("/")
     return parts[0] if parts and parts[0] else ""
 
 
 def org_of(url: str) -> str:
-    """从 remote URL 反推组织名，取不到返回空串。"""
+    """Derive the org name from a remote URL, an empty string when it
+    cannot be derived."""
     parts = norm_remote(url).split("/")
     if len(parts) >= 3:
         return parts[1]
@@ -233,17 +264,20 @@ def org_of(url: str) -> str:
 
 
 def repo_of(url: str, fallback: str = "") -> str:
-    """从 remote URL 反推仓名，取不到返回 fallback。"""
+    """Derive the repo name from a remote URL, `fallback` when it cannot be
+    derived."""
     parts = norm_remote(url).split("/")
     if len(parts) >= 3 and parts[-1]:
         return parts[-1]
     return fallback
 
 
-# 只读镜像 —— 内容由上游自动同步，推上去会被覆盖。
+# Read-only mirror — the content is synced from upstream, a push gets
+# overwritten.
 #
-# 这不是「风格偏好」，是**写错了会丢代码**：往镜像推的提交会在下一次同步时
-# 被上游版本覆盖，且没有任何提示。
+# This is not a matter of style: pushing the wrong thing **loses code**. A
+# commit pushed to a mirror is overwritten by the upstream version on the
+# next sync, with no warning at all.
 READONLY_HOSTS = {"gitee.com"}
 
 
@@ -252,9 +286,10 @@ def host_is_readonly(host: str) -> bool:
 
 
 def resolve_org() -> str:
-    """本次操作使用的组织。
+    """The org used for this operation.
 
-    优先环境变量，其次本仓 remote 里写着的（remote 是事实，推断归推断）。
+    The environment variable wins, then what is written in the remote of
+    this repo (the remote is a fact, an inference is not).
     """
     env = os.environ.get("WARDNER_ORG")
     if env:
@@ -263,10 +298,13 @@ def resolve_org() -> str:
 
 
 def resolve_source_host() -> str:
-    """本次操作使用的**源站**（github.com / gitee.com / 内网 GitLab）。
+    """The **source site** used for this operation (github.com / gitee.com /
+    an intranet GitLab).
 
-    优先环境变量，其次本仓 remote 里写着的 —— 从哪儿装的，`wdn update`
-    就继续走哪儿（国内拉 GitHub 慢，这正是装 Gitee 镜像的意义）。
+    The environment variable wins, then what is written in the remote of
+    this repo — `wdn update` keeps going to the site you installed from
+    (pulling GitHub is slow on mainland networks, which is exactly what the
+    Gitee mirror is for).
     """
     env = os.environ.get("WARDNER_SOURCE_HOST")
     if env:
@@ -275,23 +313,26 @@ def resolve_source_host() -> str:
 
 
 def source_scheme_for_host(host: str) -> str:
-    """源站 → 传输协议。
+    """Source site → transport scheme.
 
-    * **GitHub / Gitee 走 https** —— 公开仓，匿名 clone 就行，不需要账号 /
-      SSH key。这是「没登录过的用户也能装」的唯一路径。
-    * **内网走 ssh** —— 内网 GitLab 的 web 口在 8080，那是 HTTP 端口；
-      取码走 ssh 才是内网该有的方式。
+    * **GitHub / Gitee use https** — public repos, anonymous clone is
+      enough, no account / SSH key required. This is the only path that
+      works for people who have never logged in.
+    * **Intranet hosts use ssh** — the web port of an intranet GitLab is
+      8080, which is an HTTP port; ssh is the right way to fetch the code.
 
-    协议由**源站**决定，不由取脚本用的 URL 协议决定：内网 GitLab 的 /raw/
-    页面是 http 的，但代码要从 ssh 拉。
+    The scheme is decided by the **source site**, not by the scheme of the
+    URL the script was downloaded from: the /raw/ pages of an intranet
+    GitLab are served over http, but the code has to come over ssh.
     """
     return "https" if host in ("github.com", "gitee.com") else "ssh"
 
 
 def clone_url_for(host: str, org: str, repo: str) -> str:
-    """按源站拼 clone 地址（协议由源站决定）。
+    """Build the clone URL for a source site (the scheme follows the site).
 
-    SSH 的 host 不带端口 —— web 的 8080 是 HTTP 端口，不是 SSH 端口。
+    The SSH host carries no port — the 8080 of the web UI is an HTTP port,
+    not an SSH port.
     """
     if source_scheme_for_host(host) == "ssh":
         return f"git@{host.split(':')[0]}:{org}/{repo}.git"
@@ -299,7 +340,7 @@ def clone_url_for(host: str, org: str, repo: str) -> str:
 
 
 def pull(repo: Path, dry_run: bool = False, retries: int = 5, delay: int = 5):
-    """git pull --ff-only。返回 (before, after, ok, message)。"""
+    """git pull --ff-only. Returns (before, after, ok, message)."""
     before = rev(repo)
     if dry_run:
         return before, before, True, "dry-run"
@@ -312,7 +353,7 @@ def pull(repo: Path, dry_run: bool = False, retries: int = 5, delay: int = 5):
         blob = (r.stderr or r.stdout or "").strip()
         last = blob.splitlines()[-1] if blob else f"exit {r.returncode}"
         if attempt < retries:
-            warn(f"git pull 失败（第 {attempt}/{retries} 次）：{last}")
+            warn(f"git pull failed (attempt {attempt}/{retries}): {last}")
             time.sleep(delay)
     return before, rev(repo), False, last
 
@@ -325,7 +366,7 @@ def clone(url: str, dest: Path, dry_run: bool = False) -> bool:
     r = _git([*GIT_NET, "clone", "--branch", "master", url, str(dest)], dest.parent)
     if r.returncode != 0:
         blob = (r.stderr or r.stdout or "").strip()
-        bad(f"clone 失败：{url}")
+        bad(f"clone failed: {url}")
         if blob:
             for line in blob.splitlines()[-3:]:
                 note(line)
@@ -334,11 +375,11 @@ def clone(url: str, dest: Path, dry_run: bool = False) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# 包清单
+# Package list
 # ---------------------------------------------------------------------------
 
 def read_packages_conf(repo: Path) -> list[tuple[str, str]]:
-    """读 packages.conf → [(目录名, GitHub 仓名)]。"""
+    """Read packages.conf → [(directory name, GitHub repo name)]."""
     path = repo / "packages.conf"
     if not path.is_file():
         return []
@@ -353,38 +394,46 @@ def read_packages_conf(repo: Path) -> list[tuple[str, str]]:
     return out
 
 
-# 只出不进的远端名 —— 这些远端的 URL **不能**被对齐到源站。
+# Push-only remote names — the URL of these remotes **must not** be aligned
+# to the source site.
 #
-# 组织策略（见 wdnwebui/AGENTS.md「仓库地址与同步策略」）：
-#   * 局域网主仓库 = 权威源，pull + push
-#   * GitHub        = 发布镜像，**只 push**
-#   * Gitee         = 不做任何操作
+# The organisational policy (see "仓库地址与同步策略" in
+# wdnwebui/AGENTS.md):
+#   * the intranet primary repo = the authoritative source, pull + push
+#   * GitHub                  = the release mirror, **push only**
+#   * Gitee                   = nothing at all
 #
-# 把 `github` 的 URL 改写成源站，就等于把「发布镜像」悄悄变成「主仓库的副本」
-# —— 用户执行 `git push github` 时其实推回了局域网，发布根本没发生，而且
-# **没有任何提示**。这是「悄悄改推送路径」里最隐蔽的一种。
+# Rewriting the URL of `github` to the source site would silently turn the
+# "release mirror" into "a copy of the primary repo" — when the user runs
+# `git push github` they actually push back to the intranet, the release
+# never happens, and **there is no warning at all**. This is the most
+# insidious kind of "silently changing the push path".
 PUSH_ONLY_REMOTES = {"github"}
 
 
 def repo_name_of(repo: Path, fallback: str) -> str:
-    """从 remote URL 反推仓名。"""
+    """Derive the repo name from the remote URL."""
     return repo_of(remote_of(repo), fallback)
 
 
 def _pushurl_of(repo: Path, rname: str) -> str:
-    """remote.<r>.pushurl 的**显式**值（没设返回空串）。
+    """The **explicit** value of remote.<r>.pushurl (an empty string when it
+    is not set).
 
-    没设时 git 用 fetch URL 当 push 地址 —— 所以「空串」意味着「用户没表达
-    过推送意图」，我们才可以替他设。
+    When it is not set git uses the fetch URL as the push address — so an
+    "empty string" means "the user never expressed the intent to push",
+    and only then may we set one for them.
     """
     return git_out(["config", "--get", f"remote.{rname}.pushurl"], repo)
 
 
 def _push_url_for(repo: Path, org: str, repo_name: str) -> str:
-    """这个仓该用的 push 地址（必须是**可写**站点）。
+    """The push address this repo should use (it has to be a **writable**
+    site).
 
-    优先沿用仓里已有的可写 remote（保住它的协议 / 认证方式，例如内网 GitLab
-    的 SSH 形式）；一个都没有就退回 GitHub 的 https 形式。
+    An existing writable remote of the repo is preferred (that keeps its
+    protocol / authentication method, e.g. the SSH form of an intranet
+    GitLab); without any, fall back to the https form of GitHub.
     """
     for _rname, url in list_remotes(repo):
         host = host_of(url)
@@ -395,59 +444,67 @@ def _push_url_for(repo: Path, org: str, repo_name: str) -> str:
 
 def _sync_remotes(name: str, repo: Path, want_url: str, keep: bool = False,
                   dry_run: bool = False, push_url: str = "") -> None:
-    """把仓的 remote 对齐到源站，并保证 pull 真的从源站走。
+    """Align the remotes of a repo to the source site and make sure the
+    pull really goes through the source site.
 
-    ⚠️ remote 名不统一（origin / github / rk 都见过），而 `git pull` 不带
-       参数时用的是 ``branch.<br>.remote`` —— **只改 origin 的 URL 是不生效
-       的**：这台板子上 8 个包的 master 跟踪的是 `github`（已指向 GitHub），
-       而 `origin` 指着内网镜像；反过来也有仓跟踪的是内网那个。
+    ⚠️ The remote names are not consistent (origin / github / rk have all
+       been seen), and `git pull` without arguments uses
+       ``branch.<br>.remote`` — **changing only the URL of origin does not
+       work**: on this board the master of the 8 packages tracks `github`
+       (which already points at GitHub), while `origin` points at the
+       intranet mirror; and there are repos that track the intranet one
+       instead.
 
-    规则：
+    The rules:
 
-    * 所有 remote 的 URL 都指向源站（内网镜像 → GitHub / Gitee）；
-    * **只在**当前分支跟踪的 remote 不指向源站时，才把跟踪关系改到
-      一个指向源站的 remote —— 跟踪关系同时也是用户的推送路径，擅自
-      改会让 `git push` 悄悄改道；
-    * 源站是**只读镜像**（Gitee）时，另设 pushurl 指向可写站点：
-      fetch 走镜像（国内快），push 走 GitHub（镜像是只读的，推了会被
-      下一次同步覆盖）。
+    * the URL of every remote points at the source site (intranet mirror →
+      GitHub / Gitee);
+    * the tracking relation is only moved to a remote that points at the
+      source site when the tracked remote does not point at it — the
+      tracking relation is also the push path of the user, changing it
+      behind their back makes `git push` silently go somewhere else;
+    * when the source site is a **read-only mirror** (Gitee), a separate
+      pushurl points at a writable site: the fetch goes through the
+      mirror (fast on mainland networks), the push goes to GitHub (the
+      mirror is read-only, a push would be overwritten by the next sync).
     """
     want_key = norm_remote(want_url)
     want_host = host_of(want_url)
-    want_host_label = "Gitee 镜像" if want_host == "gitee.com" else want_host
+    want_host_label = "the Gitee mirror" if want_host == "gitee.com" else want_host
     readonly = host_is_readonly(want_host)
 
-    # ① URL 对齐（fetch）
+    # ① align the URLs (fetch)
     for rname, url in list_remotes(repo):
         if rname in PUSH_ONLY_REMOTES:
-            # 只出不进的发布镜像 —— 不动它的 URL
+            # the release mirror that is push-only — leave its URL alone
             if dry_run:
-                note(f"[dry-run] {name}: {rname} 保留（只 push 的发布镜像）")
+                note(f"[dry-run] {name}: {rname} kept as is (push-only release mirror)")
             continue
         if norm_remote(url) != want_key and not keep:
             if dry_run:
-                note(f"[dry-run] {name}: {rname} {url or '(空)'} → {want_url}")
+                note(f"[dry-run] {name}: {rname} {url or '(empty)'} → {want_url}")
             elif _git(["remote", "set-url", rname, want_url], repo).returncode == 0:
-                ok(f"{name}: {rname} {url or '(空)'} → {want_url}")
+                ok(f"{name}: {rname} {url or '(empty)'} → {want_url}")
 
-        # ② 只读镜像：push 路径单独指回可写站点
+        # ② read-only mirror: point the push path back at a writable site
         #
-        # 用户没设过 pushurl 时才替他设 —— 设了就说明用户表达过推送意图，
-        # 擅自改同样是「悄悄改推送路径」。
+        # The pushurl is only set when the user has not set one — a pushurl
+        # means the user expressed the intent to push, and changing that
+        # behind their back is "silently changing the push path" as well.
         if readonly and push_url and not keep:
             if _pushurl_of(repo, rname):
                 continue
             if dry_run:
                 note(f"[dry-run] {name}: {rname} pushurl → {push_url}")
             elif _git(["remote", "set-url", "--push", rname, push_url], repo).returncode == 0:
-                ok(f"{name}: {rname} push → {push_url}（源站是只读镜像）")
+                ok(f"{name}: {rname} push → {push_url} (the source site is a read-only mirror)")
 
-    # ③ 分支跟踪
+    # ③ branch tracking
     br = current_branch(repo)
     if keep or not br or br == "HEAD":
         return
 
-    remotes = list_remotes(repo)   # 改完 URL 重新读一遍
+    remotes = list_remotes(repo)   # read the URLs again after changing them
     tracked = tracked_remote(repo, br)
     tracked_url = ""
     for rname, url in remotes:
@@ -456,9 +513,10 @@ def _sync_remotes(name: str, repo: Path, want_url: str, keep: bool = False,
             break
 
     if tracked and norm_remote(tracked_url) == want_key:
-        return   # 已经在源站上 —— 不动用户的跟踪关系
+        return   # already on the source site — leave the tracking relation alone
 
-    # 挑一个指向源站的 remote：优先 HTTPS（匿名可用）
+    # Pick a remote that points at the source site: HTTPS first (usable
+    # anonymously)
     pick = ""
     for rname, url in remotes:
         if norm_remote(url) == want_key and url.startswith("https://"):
@@ -472,21 +530,21 @@ def _sync_remotes(name: str, repo: Path, want_url: str, keep: bool = False,
     if not pick:
         pick = "origin"
         if dry_run:
-            note(f"[dry-run] {name}: 新建 remote origin → {want_url}")
+            note(f"[dry-run] {name}: create the remote origin → {want_url}")
         elif _git(["remote", "add", "origin", want_url], repo).returncode == 0:
-            ok(f"{name}: 新建 remote origin → {want_url}")
+            ok(f"{name}: created the remote origin → {want_url}")
 
     if dry_run:
-        note(f"[dry-run] {name}: 分支 {br} 跟踪 {tracked or '(无)'} → {pick}")
+        note(f"[dry-run] {name}: branch {br} tracks {tracked or '(none)'} → {pick}")
         return
     _git(["config", f"branch.{br}.remote", pick], repo)
     if br == "master":
         _git(["config", f"branch.{br}.merge", "refs/heads/master"], repo)
-    ok(f"{name}: 分支 {br} 跟踪 {tracked or '(无)'} → {pick}（{want_host_label}）")
+    ok(f"{name}: branch {br} tracks {tracked or '(none)'} → {pick} ({want_host_label})")
 
 
 # ---------------------------------------------------------------------------
-# 子命令：update
+# Subcommand: update
 # ---------------------------------------------------------------------------
 
 def cmd_update(args: argparse.Namespace) -> int:
@@ -497,44 +555,47 @@ def cmd_update(args: argparse.Namespace) -> int:
 
     if not vpy.is_file():
         err(
-            "[fail] 还没装好 —— 找不到 venv 的 python",
+            "[fail] not installed yet — the python of the venv was not found",
             f"       {vpy}",
-            f"       先跑一遍安装： bash {wrepo}/install.sh",
+            f"       run the installer once first: bash {wrepo}/install.sh",
         )
         return 2
 
     org = resolve_org()
     source_host = resolve_source_host()
     host_name = os.environ.get("WARDNER_HOST_REPO") or "wdnwebui"
-    results: list[tuple[str, str, str, bool, str]] = []  # 名, before, after, ok, msg
+    results: list[tuple[str, str, str, bool, str]] = []  # name, before, after, ok, msg
 
-    step("更新仓库")
+    step("Updating the repos")
 
-    # ① 先更新自己 —— 后面的 packages.conf 才是最新的
+    # ① update itself first — only then is packages.conf the latest
     before, after, good, msg = pull(wrepo, args.dry_run)
     results.append((repo_name_of(wrepo, wrepo.name), before, after, good, msg))
     if not good:
-        bad(f"{wrepo.name} 更新失败：{msg}")
+        bad(f"{wrepo.name} update failed: {msg}")
 
-    # ② 上游 packages.conf 加了新包的话，这里补 clone
+    # ② clone the packages that upstream added to packages.conf
     pkgs = read_packages_conf(wrepo)
     if pkgs:
-        step("补齐缺失的包")
+        step("Filling in the missing packages")
         for pkg, repo_name in pkgs:
             dest = src / pkg
             if (dest / ".git").is_dir():
                 continue
-            note(f"{pkg} 缺失 —— clone")
+            note(f"{pkg} is missing — cloning")
             if not clone(clone_url_for(source_host, org, repo_name), dest, args.dry_run):
-                bad(f"{pkg} 拉取失败")
+                bad(f"failed to fetch {pkg}")
 
-    # ③ remote 对齐源站
+    # ③ align the remotes to the source site
     #
-    # 「wdn update 通过源站更新」是硬要求：源站是哪个（GitHub / Gitee 镜像）
-    # 由**本仓的 remote**决定 —— 从哪儿装的，更新还走哪儿。
-    # 分支跟踪关系只在「跟踪的 remote 不指向源站」时才动 —— 跟踪关系也是
-    # 用户的推送路径，擅自改会让 `git push` 改道。
-    step(f"对齐 remote 到 {source_host}")
+    # "wdn update updates through the source site" is a hard requirement:
+    # which site that is (GitHub / the Gitee mirror) is decided by the
+    # **remote of this repo** — wherever it was installed from, the update
+    # goes there as well. The branch tracking relation is only touched
+    # when the tracked remote does not point at the source site — the
+    # tracking relation is also the push path of the user, changing it
+    # behind their back makes `git push` go somewhere else.
+    step(f"Aligning the remotes to {source_host}")
     for name, path, repo_name in _all_repos(wrepo, hrepo, pkgs, host_name):
         if not (path / ".git").is_dir():
             continue
@@ -545,37 +606,40 @@ def cmd_update(args: argparse.Namespace) -> int:
         )
 
     if host_is_readonly(source_host):
-        warn(f"{source_host} 是只读镜像（内容由上游自动同步）—— 拉取/更新走它没问题，")
-        warn("但**不要往它推代码**：推送请用 GitHub 或内网主仓库。")
-        warn("（pushurl 已指向可写站点，用户没自定义过 pushurl 时由 wdn 自动设好）")
+        warn(f"{source_host} is a read-only mirror (the content is synced from upstream automatically) — pulling/updating through it is fine,")
+        warn("but **never push code to it**: push to GitHub or to the intranet primary repo.")
+        warn("(the pushurl points at a writable site; wdn sets it when the user has not defined one)")
 
-    # ④ pull 宿主应用
-    step("拉取最新代码")
+    # ④ pull the host application
+    step("Pulling the latest code")
     before, after, good, msg = pull(hrepo, args.dry_run)
     results.append((host_name, before, after, good, msg))
     if good:
         if before == after:
-            ok(f"{host_name}: {short(after)} （无变化）")
+            ok(f"{host_name}: {short(after)} (no change)")
         else:
             ok(f"{host_name}: {short(before)} → {short(after)}")
     else:
-        bad(f"{host_name} 更新失败：{msg}")
+        bad(f"{host_name} update failed: {msg}")
 
-    # ⑤ 8 个 SDK 包 —— 交给 update_rkwhl.sh
+    # ⑤ the 8 SDK packages — delegated to update_rkwhl.sh
     #
-    # 它自己 pull（所以 HEAD 前后对比才有意义），HEAD 变了就卸载重装 +
-    # 重编 .so，并做 .so 落地断言 / 卡片注册校验 / 依赖审计。
-    step("同步 SDK / 插件包")
+    # It pulls on its own (so that the HEAD comparison makes sense), and
+    # when the HEAD changed it uninstalls, reinstalls + recompiles the .so,
+    # and runs the .so landing assertions / the card registration checks /
+    # the dependency audit.
+    step("Syncing the SDK / plugin packages")
     pkg_before = {pkg: rev(src / pkg) for pkg, _ in pkgs if (src / pkg / ".git").is_dir()}
 
     script = hrepo / "update_rkwhl.sh"
     if not script.is_file():
-        bad(f"找不到 {script}")
+        bad(f"not found: {script}")
         return 1
     if args.dry_run:
-        note("[dry-run] 跳过 update_rkwhl.sh（它会真的 pip install）")
+        note("[dry-run] skipping update_rkwhl.sh (it really pip installs)")
     else:
-        # 包来源前缀跟着源站走（协议由源站决定：GitHub/Gitee → https，内网 → ssh）
+        # The package source prefix follows the source site (the scheme is
+        # decided by the source site: GitHub/Gitee → https, intranet → ssh)
         if source_scheme_for_host(source_host) == "ssh":
             pkg_base = f"git+ssh://git@{source_host.split(':')[0]}/{org}"
         else:
@@ -588,7 +652,7 @@ def cmd_update(args: argparse.Namespace) -> int:
             stdin=subprocess.DEVNULL,
         )
         if r.returncode != 0:
-            bad(f"update_rkwhl.sh 未全部成功（exit {r.returncode}）—— 详见上方日志")
+            bad(f"update_rkwhl.sh did not fully succeed (exit {r.returncode}) — see the log above")
 
     for pkg, _ in pkgs:
         p = src / pkg
@@ -598,13 +662,13 @@ def cmd_update(args: argparse.Namespace) -> int:
         a = rev(p)
         results.append((pkg, b, a, True, ""))
 
-    # ⑥ 冒烟：4 个 SDK 必须真的 import 得起来
+    # ⑥ smoke test: the 4 SDKs must really be importable
     if not args.dry_run:
-        step("冒烟验证")
+        step("Smoke test")
         _smoke()
 
-    # ⑦ 汇总
-    step("汇总")
+    # ⑦ summary
+    step("Summary")
     _print_results(results)
 
     if any(not good for _, _, _, good, _ in results):
@@ -613,7 +677,7 @@ def cmd_update(args: argparse.Namespace) -> int:
 
 
 def _all_repos(wrepo: Path, hrepo: Path, pkgs: list[tuple[str, str]], host_name: str):
-    """(显示名, 路径, 期望的 GitHub 仓名)"""
+    """(display name, path, expected GitHub repo name)"""
     out = [
         (repo_name_of(wrepo, wrepo.name), wrepo, repo_name_of(wrepo, wrepo.name)),
         (host_name, hrepo, host_name),
@@ -624,12 +688,14 @@ def _all_repos(wrepo: Path, hrepo: Path, pkgs: list[tuple[str, str]], host_name:
 
 
 def _smoke() -> None:
-    """在 venv 的 python 里 import 4 个 SDK。
+    """Import the 4 SDKs with the python of the venv.
 
-    这道断言必须有：update_rkwhl.sh 的 verify_outputs 对 wdnai / wdnhid
-    直接 `return 0`（纯 Python，没有 .so 可断言），audit_sdk_deps 也只查
-    「SDK 声明的依赖能不能用」，不查包自身能不能 import。editable 装歪
-    （.pth 指向不存在的路径）会穿过所有门禁。
+    This assertion has to exist: verify_outputs of update_rkwhl.sh simply
+    `return 0` for wdnai / wdnhid (pure Python, no .so to assert), and
+    audit_sdk_deps only checks "can the SDK-declared dependencies be used",
+    not whether the package itself can be imported. A broken editable
+    install (a .pth pointing at a path that does not exist) slips through
+    every gate.
     """
     code = (
         "import importlib,sys\n"
@@ -651,12 +717,12 @@ def _smoke() -> None:
     )
     sys.stdout.write(r.stdout)
     if r.returncode != 0:
-        bad("SDK import 检查未通过 —— 上面失败的包没装好")
+        bad("the SDK import check failed — the packages listed above are not installed properly")
         err(
-            "[fail] SDK import 检查未通过",
-            "       常见原因：editable 安装的 .pth 指向了不存在的路径。",
-            "       修复：删掉对应包目录后重跑 wdn update：",
-            f"         rm -rf {venv_src()}/<包名>",
+            "[fail] the SDK import check did not pass",
+            "       common cause: the .pth of an editable install points at a path that does not exist.",
+            "       fix: delete the directory of the affected package and run wdn update again:",
+            f"         rm -rf {venv_src()}/<package-name>",
         )
 
 
@@ -666,7 +732,7 @@ def _print_results(results) -> None:
     width = max(len(name) for name, _, _, _, _ in results)
     for name, before, after, good, msg in results:
         if not good:
-            print(f"  {name:<{width}}  {C_RED}{short(before)} → {short(after)}  失败{C_RST}")
+            print(f"  {name:<{width}}  {C_RED}{short(before)} → {short(after)}  failed{C_RST}")
             if msg:
                 note(msg)
             continue
@@ -677,7 +743,7 @@ def _print_results(results) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 子命令：status
+# Subcommand: status
 # ---------------------------------------------------------------------------
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -686,11 +752,11 @@ def cmd_status(args: argparse.Namespace) -> int:
     org = resolve_org()
     pkgs = read_packages_conf(wrepo)
 
-    step("仓库状态")
+    step("Repo status")
     rows = []
     for name, path, _ in _all_repos(wrepo, hrepo, pkgs, os.environ.get("WARDNER_HOST_REPO") or "wdnwebui"):
         if not (path / ".git").is_dir():
-            rows.append((name, "—", "（未安装）"))
+            rows.append((name, "—", "(not installed)"))
             continue
         br = current_branch(path)
         tr = tracked_remote(path, br)
@@ -699,7 +765,7 @@ def cmd_status(args: argparse.Namespace) -> int:
             if rname == tr:
                 url = rurl
                 break
-        rows.append((name, short(rev(path)), f"{tr or '-'} → {url or '（无 remote）'}"))
+        rows.append((name, short(rev(path)), f"{tr or '-'} → {url or '(no remote)'}"))
 
     width = max(len(r[0]) for r in rows)
     for name, sha, rem in rows:
@@ -708,7 +774,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     step("venv")
     vpy = venv_python()
     if not vpy.is_file():
-        bad(f"还没装好 —— {vpy} 不存在")
+        bad(f"not installed yet — {vpy} does not exist")
         return 1
     ver = subprocess.run(
         [str(vpy), "-c", "import sys;print('%d.%d.%d' % sys.version_info[:3])"],
@@ -722,16 +788,558 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
-# 子命令：version
+# Subcommand: version
 # ---------------------------------------------------------------------------
 
 def cmd_version(args: argparse.Namespace) -> int:
     print(f"wdn {VERSION}")
-    print(f"  安装根目录  {wardner_home()}")
-    print(f"  安装器仓    {wardner_repo()}")
-    print(f"  宿主应用    {host_repo()}")
-    print(f"  venv python {venv_python()}")
+    print(f"  install root  {wardner_home()}")
+    print(f"  installer     {wardner_repo()}")
+    print(f"  host app      {host_repo()}")
+    print(f"  venv python   {venv_python()}")
     return 0
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: doctor
+#
+# A health check for the whole installation. The question it answers is
+# "is this board actually able to run the thing, and if not, what exactly
+# is missing?" — with the emphasis on the two failure classes that are
+# invisible until something breaks:
+#
+#   1. a native library is missing (the .so of wdndds / wdnav was never
+#      built, or was deleted) — the Python import still works, the feature
+#      only fails at runtime;
+#   2. a version does not match (the source tree was pulled but the
+#      package was not reinstalled → the .so is older than the sources;
+#      a pinned dependency is not satisfied → a different API than the
+#      one the SDK was written against).
+#
+# The check is read-only: it never installs, never pulls and never
+# modifies anything, so it is safe to run on a live board.
+# ---------------------------------------------------------------------------
+
+# The native libraries that have to be there after the install.
+#
+# ⚠️ update_rkwhl.sh::verify_outputs carries an **inline copy** of this table
+#    — **changing one means changing the other**.
+REQUIRED_SO = {
+    "wdndds": ["libwdndds_idl.so", "libwdndds_cshim.so"],
+    "wdnav": ["libshim_video.so"],
+}
+
+# The commands needed to build the .so — missing ones are a warning, not an
+# error, as long as the .so is already there.
+BUILD_CMDS = ["git", "cmake", "make", "cc", "patchelf"]
+
+# The apt packages that provide them.
+BUILD_PKGS = ["cmake", "build-essential", "patchelf", "libfoonathan-memory-dev"]
+
+# The SDKs that have to be importable.
+SDK_MODULES = ["wdnav", "wdnai", "wdndds", "wdnhid"]
+
+_REQ_RE = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)(\[[^\]]*\])?\s*(.*)$")
+
+
+def _parse_requirement(raw: str) -> tuple[str, str] | None:
+    """A requirement line → (name, specifier)."""
+    raw = (raw or "").split("#", 1)[0].strip()
+    if not raw or raw.startswith("-"):
+        return None
+    raw = raw.split(";", 1)[0].strip()
+    m = _REQ_RE.match(raw)
+    if not m:
+        return None
+    return m.group(1), (m.group(3) or "").strip()
+
+
+def _installed_version(name: str) -> str | None:
+    """The version of an installed distribution, None when it is not
+    installed."""
+    import importlib.metadata as md
+
+    try:
+        return md.version(name)
+    except md.PackageNotFoundError:
+        return None
+
+
+def _spec_satisfied(installed: str, spec: str) -> bool | None:
+    """Does `installed` satisfy `spec`? None when it cannot be decided."""
+    if not spec:
+        return True
+    try:
+        from packaging.specifiers import SpecifierSet
+
+        return installed in SpecifierSet(spec)
+    except Exception:
+        pass
+    # Fallback without packaging: only an exact pin can be decided.
+    m = re.match(r"^==\s*([^\s,]+)$", spec.strip())
+    if m:
+        return installed == m.group(1)
+    return None
+
+
+def _source_version(pkg_dir: Path) -> str:
+    """The version declared in the pyproject.toml of the source tree."""
+    pyproject = pkg_dir / "pyproject.toml"
+    if not pyproject.is_file():
+        return ""
+    try:
+        text = pyproject.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    try:
+        import tomllib
+
+        data = tomllib.loads(text)
+        return str(data.get("project", {}).get("version", "") or "")
+    except Exception:
+        m = re.search(r'^\s*version\s*=\s*"([^"]+)"', text, re.M)
+        return m.group(1) if m else ""
+
+
+def _find_so(name: str, pkg_dir: Path) -> Path | None:
+    """Find a .so by name — in the source tree of the package or in the
+    site-packages of the venv."""
+    roots = [pkg_dir, site_packages()]
+    for root in roots:
+        if not root.is_dir():
+            continue
+        try:
+            for p in root.rglob(name):
+                if p.is_file():
+                    return p
+        except OSError:
+            continue
+    return None
+
+
+def _lib_dirs(pkg_dir: Path, so: Path) -> list[str]:
+    """The directories the dynamic linker has to search for this package.
+
+    The .so is linked with a RUNPATH of ``$ORIGIN/lib``, but the packages
+    ship their libraries in more than one place: the build output sits
+    next to the .so (``_native/``), the bundled prebuilt binaries in
+    ``native/lib/``. The SDKs resolve them at runtime by preloading the
+    SONAMEs with ctypes — so a plain ``ldd`` would report "not found" for
+    libraries that work perfectly well in production.
+
+    Mirroring the search path of the runtime is what makes the ldd result
+    meaningful.
+    """
+    dirs = [str(so.parent)]
+    try:
+        for p in pkg_dir.rglob("lib"):
+            if p.is_dir():
+                dirs.append(str(p))
+    except OSError:
+        pass
+    return dirs
+
+
+def _missing_shared_libs(so: Path, pkg_dir: Path) -> list[str]:
+    """The shared libraries the .so needs but cannot find (ldd, with the
+    search path of the package)."""
+    ldd = shutil.which("ldd")
+    if not ldd:
+        return []
+    env = dict(os.environ)
+    extra = _lib_dirs(pkg_dir, so)
+    old = env.get("LD_LIBRARY_PATH", "")
+    env["LD_LIBRARY_PATH"] = ":".join([*extra, old] if old else extra)
+    try:
+        r = subprocess.run(
+            [ldd, str(so)], capture_output=True, text=True, timeout=30,
+            stdin=subprocess.DEVNULL, env=env,
+        )
+    except Exception:
+        return []
+    out = f"{r.stdout}\n{r.stderr}"
+    return [ln.strip() for ln in out.splitlines() if "not found" in ln]
+
+
+def _human_size(n: int) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024.0
+    return f"{n:.1f} GB"
+
+
+def _check_system() -> int:
+    """The system the board runs on, and the state of the install root."""
+    import platform
+
+    problems = 0
+    step("System")
+    ok(f"{platform.system()} {platform.release()} ({platform.machine()})")
+    ok(f"Python {platform.python_version()} — {sys.executable}")
+
+    vpy = venv_python()
+    if vpy.is_file():
+        ok(f"venv python: {vpy}")
+    else:
+        bad(f"the venv python is missing: {vpy}")
+        problems += 1
+
+    home = wardner_home()
+    if home.is_dir():
+        if os.access(home, os.W_OK):
+            ok(f"install root is writable: {home}")
+        else:
+            bad(f"the install root is not writable: {home}")
+            problems += 1
+    else:
+        bad(f"the install root does not exist: {home}")
+        problems += 1
+
+    try:
+        usage = shutil.disk_usage(home if home.is_dir() else Path.home())
+        free_gb = usage.free / (1024 ** 3)
+        if free_gb < 1:
+            bad(f"only {free_gb:.1f} GB free on {usage.total // (1024 ** 3)} GB disk")
+            problems += 1
+        else:
+            ok(f"free disk space: {free_gb:.1f} GB")
+    except OSError:
+        pass
+    return problems
+
+
+def _check_toolchain() -> int:
+    """The build toolchain — needed to (re)build the .so."""
+    problems = 0
+    step("Build toolchain")
+    missing_cmds = []
+    for cmd in BUILD_CMDS:
+        path = shutil.which(cmd)
+        if path:
+            ok(f"{cmd}: {path}")
+        else:
+            missing_cmds.append(cmd)
+    if missing_cmds:
+        warn(f"missing commands: {', '.join(missing_cmds)}")
+        note("  they are only needed to build the .so; run the installer again as root to get them:")
+        note("  apt-get install -y cmake build-essential patchelf libfoonathan-memory-dev")
+        problems += 1
+
+    dpkg = shutil.which("dpkg")
+    if dpkg:
+        missing_pkgs = []
+        for pkg in BUILD_PKGS:
+            r = subprocess.run(
+                [dpkg, "-s", pkg], capture_output=True, text=True,
+                stdin=subprocess.DEVNULL,
+            )
+            if r.returncode != 0:
+                missing_pkgs.append(pkg)
+        if missing_pkgs:
+            warn(f"missing apt packages: {', '.join(missing_pkgs)}")
+            note("  apt-get update && apt-get install -y " + " ".join(missing_pkgs))
+            problems += 1
+        else:
+            ok("all apt packages of the build toolchain are installed")
+    return problems
+
+
+def _check_native_libs(pkgs: list[tuple[str, str]]) -> int:
+    """Do the native libraries exist, and can they be loaded?"""
+    problems = 0
+    step("Native libraries (.so)")
+
+    found_any = False
+    for pkg, _ in pkgs:
+        wanted = REQUIRED_SO.get(pkg)
+        if not wanted:
+            continue
+        pkg_dir = venv_src() / pkg
+        if not pkg_dir.is_dir():
+            bad(f"{pkg}: the source tree is missing ({pkg_dir})")
+            problems += 1
+            continue
+        for so_name in wanted:
+            so = _find_so(so_name, pkg_dir)
+            if so is None:
+                bad(f"{so_name}: missing — the feature that needs it will not work")
+                problems += 1
+                continue
+            found_any = True
+            try:
+                size = _human_size(so.stat().st_size)
+            except OSError:
+                size = "?"
+            missing = _missing_shared_libs(so, pkg_dir)
+            if missing:
+                bad(f"{so_name}: present ({size}) but {len(missing)} shared librar"
+                    f"{'y' if len(missing) == 1 else 'ies'} not found")
+                for m in missing:
+                    note(f"  {m}")
+                problems += 1
+            else:
+                ok(f"{so_name}: present ({size}) — {so}")
+
+    if not found_any:
+        note("rebuild them with: bash " + str(host_repo() / "update_rkwhl.sh"))
+    return problems
+
+
+def _check_sdk_imports() -> int:
+    """Can the SDKs really be imported?"""
+    problems = 0
+    step("SDK imports")
+    # The result is printed behind a marker: importing the SDKs makes
+    # librga write a native banner to stdout when the interpreter tears
+    # down, so the plain stdout cannot be parsed as JSON.
+    marker = "__WDN_IMPORT_RESULT__"
+    code = (
+        "import importlib,json,sys\n"
+        "out={}\n"
+        "for m in %r:\n"
+        "    try:\n"
+        "        importlib.import_module(m); out[m]='ok'\n"
+        "    except Exception as e:\n"
+        "        out[m]='%%s: %%s' %% (type(e).__name__, e)\n"
+        "sys.stderr.write('\\n%s' + json.dumps(out))\n" % (SDK_MODULES, marker)
+    )
+    try:
+        r = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True, text=True, timeout=120,
+            stdin=subprocess.DEVNULL,
+        )
+        import json
+
+        blob = r.stderr.strip().splitlines()
+        line = next((ln for ln in reversed(blob) if ln.startswith(marker)), "")
+        res = json.loads(line[len(marker):]) if line else {}
+    except Exception as e:
+        bad(f"could not run the import check: {e}")
+        return 1
+
+    for m in SDK_MODULES:
+        state = res.get(m, "unknown")
+        if state == "ok":
+            ok(f"import {m}: ok")
+        else:
+            bad(f"import {m}: FAILED ({state})")
+            problems += 1
+    return problems
+
+
+def _check_sdk_versions(pkgs: list[tuple[str, str]]) -> int:
+    """Does the installed version match the version of the source tree?
+
+    A mismatch means the source tree was pulled but the package was not
+    reinstalled — the .so is then older than the sources that should
+    produce it.
+    """
+    problems = 0
+    step("SDK versions")
+    for pkg, _ in pkgs:
+        installed = _installed_version(pkg)
+        source = _source_version(venv_src() / pkg)
+        if installed is None:
+            bad(f"{pkg}: not installed")
+            problems += 1
+            continue
+        if not source:
+            ok(f"{pkg}: {installed} (the source tree declares no version)")
+            continue
+        if installed == source:
+            ok(f"{pkg}: {installed}")
+        else:
+            bad(f"{pkg}: installed {installed} but the source tree declares {source}")
+            note("  the installed package is stale — reinstall it:")
+            note(f"  bash {host_repo() / 'update_rkwhl.sh'}")
+            problems += 1
+    return problems
+
+
+def _check_requirement_versions() -> int:
+    """Do the installed dependencies satisfy requirements.txt?"""
+    problems = 0
+    step("Dependency versions")
+    req = host_repo() / "requirements.txt"
+    if not req.is_file():
+        warn(f"requirements.txt not found: {req}")
+        return 0
+
+    try:
+        lines = req.read_text(encoding="utf-8").splitlines()
+    except OSError as e:
+        warn(f"cannot read {req}: {e}")
+        return 0
+
+    checked = 0
+    for line in lines:
+        parsed = _parse_requirement(line)
+        if not parsed:
+            continue
+        name, spec = parsed
+        installed = _installed_version(name)
+        if installed is None:
+            bad(f"{name}: not installed" + (f" (requirements.txt wants {spec})" if spec else ""))
+            problems += 1
+            continue
+        checked += 1
+        if not spec:
+            ok(f"{name} {installed}")
+            continue
+        verdict = _spec_satisfied(installed, spec)
+        if verdict is True:
+            ok(f"{name} {installed} (matches {spec})")
+        elif verdict is False:
+            bad(f"{name} {installed} — requirements.txt wants {spec}")
+            note(f"  .venv/bin/pip install '{name}{spec}'")
+            problems += 1
+        else:
+            warn(f"{name} {installed} — cannot verify against {spec} (installing packaging would help)")
+    if checked == 0:
+        warn("no requirement could be checked")
+    return problems
+
+
+def _check_declared_deps() -> int:
+    """The dependencies the SDKs declare — audited by the script that
+    update_rkwhl.sh uses."""
+    problems = 0
+    step("Declared SDK dependencies")
+    checker = host_repo() / "scripts" / "check_sdk_deps.py"
+    if not checker.is_file():
+        warn(f"the audit script is missing: {checker}")
+        return 0
+    try:
+        r = subprocess.run(
+            [sys.executable, str(checker), "--quiet"],
+            cwd=str(host_repo()), capture_output=True, text=True,
+            timeout=300, stdin=subprocess.DEVNULL,
+        )
+    except Exception as e:
+        warn(f"could not run the audit: {e}")
+        return 0
+    if r.returncode == 0:
+        ok("every declared dependency is installed and importable")
+    else:
+        bad("the dependency audit did not pass (see the details above)")
+        for line in (r.stdout or "").splitlines()[-12:]:
+            note(line)
+        problems += 1
+    return problems
+
+
+def _check_plugins(pkgs: list[tuple[str, str]]) -> int:
+    """Are the cards of the plugin packages really registered?"""
+    problems = 0
+    step("Card plugins")
+    checker = host_repo() / "scripts" / "check_plugin_entrypoints.py"
+    plugins = [p for p, _ in pkgs if p.startswith("wdnapps")]
+    if not plugins:
+        warn("no plugin packages are listed in packages.conf")
+        return 0
+    if not checker.is_file():
+        warn(f"the checker script is missing: {checker}")
+        return 0
+
+    for pkg in plugins:
+        try:
+            r = subprocess.run(
+                [sys.executable, str(checker), pkg],
+                cwd=str(host_repo()), capture_output=True, text=True,
+                timeout=120, stdin=subprocess.DEVNULL,
+            )
+        except Exception as e:
+            warn(f"{pkg}: the check could not be run: {e}")
+            problems += 1
+            continue
+        cards = 0
+        bads = []
+        for line in (r.stdout or "").splitlines():
+            line = line.strip()
+            if line.startswith("OK "):
+                cards += 1
+            elif line.startswith("BAD"):
+                bads.append(line)
+        if bads:
+            bad(f"{pkg}: {len(bads)} card(s) failed the registration check")
+            for b in bads:
+                note(f"  {b}")
+            problems += 1
+        else:
+            ok(f"{pkg}: {cards} card(s) registered")
+    return problems
+
+
+def _check_repos(online: bool = False) -> int:
+    """The state of the repos — and with --online whether they are behind
+    their remote."""
+    problems = 0
+    step("Repos")
+    wrepo = wardner_repo()
+    hrepo = host_repo()
+    pkgs = read_packages_conf(wrepo)
+    host_name = os.environ.get("WARDNER_HOST_REPO") or "wdnwebui"
+    source_host = resolve_source_host()
+
+    for name, path, _ in _all_repos(wrepo, hrepo, pkgs, host_name):
+        if not (path / ".git").is_dir():
+            warn(f"{name}: not installed")
+            continue
+        br = current_branch(path)
+        tr = tracked_remote(path, br)
+        url = ""
+        for rname, rurl in list_remotes(path):
+            if rname == tr:
+                url = rurl
+                break
+        sha = short(rev(path))
+        h = host_of(url)
+        if not url:
+            warn(f"{name}: {sha} — no remote is tracked")
+            continue
+        if h != source_host:
+            warn(f"{name}: {sha} — the tracked remote points at {h or 'an unknown host'},"
+                 f" not at the source site {source_host}")
+        else:
+            ok(f"{name}: {sha} — {br} → {h}")
+
+        if online and url:
+            r = _git(["ls-remote", url, br], path, timeout=60)
+            if r.returncode == 0 and r.stdout.strip():
+                remote_sha = r.stdout.split()[0]
+                if remote_sha and remote_sha != rev(path):
+                    bad(f"{name}: behind the remote — local {short(rev(path))},"
+                        f" remote {short(remote_sha)}")
+                    note("  run: wdn update")
+                    problems += 1
+                else:
+                    ok(f"{name}: up to date with {h}")
+    return problems
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    """Check the system environment and the installation."""
+    pkgs = read_packages_conf(wardner_repo())
+
+    problems = 0
+    problems += _check_system()
+    problems += _check_toolchain()
+    problems += _check_native_libs(pkgs)
+    problems += _check_sdk_imports()
+    problems += _check_sdk_versions(pkgs)
+    problems += _check_requirement_versions()
+    problems += _check_declared_deps()
+    problems += _check_plugins(pkgs)
+    problems += _check_repos(online=getattr(args, "online", False))
+
+    step("Summary")
+    if problems == 0:
+        ok("everything checks out")
+        return 0
+    bad(f"{problems} problem(s) found — see the details above")
+    return 1
 
 
 # ---------------------------------------------------------------------------
@@ -739,21 +1347,26 @@ def cmd_version(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="wdn",
-        description="wardner 命令行工具：更新 / 查看本板上的 wdnwebui 装置。",
+        description="the wardner command line tool: update / inspect the wdnwebui installation on this board.",
     )
     p.add_argument("--version", action="version", version=f"wdn {VERSION}")
     sub = p.add_subparsers(dest="cmd")
 
-    up = sub.add_parser("update", help="把所有已下载的仓更新到源站最新（GitHub / Gitee 镜像），并重新同步 venv")
-    up.add_argument("--dry-run", action="store_true", help="只看会发生什么，不真的 pull / 装包")
+    up = sub.add_parser("update", help="update every downloaded repo to the latest revision of the source site (GitHub / the Gitee mirror) and re-sync the venv")
+    up.add_argument("--dry-run", action="store_true", help="only show what would happen, do not pull / install")
     up.add_argument("--keep-remotes", action="store_true",
-                    help="不动各仓的 remote 和分支跟踪（默认会对齐到源站）")
+                    help="leave the remotes and the branch tracking of every repo alone (by default they are aligned to the source site)")
     up.set_defaults(func=cmd_update)
 
-    st = sub.add_parser("status", help="列出各仓的 commit / remote 和 venv 状态")
+    st = sub.add_parser("status", help="list the commit / remote of every repo and the state of the venv")
     st.set_defaults(func=cmd_status)
 
-    vn = sub.add_parser("version", help="打印版本号")
+    dr = sub.add_parser("doctor", help="check the system environment: the native .so files, the SDK versions, the dependency versions, the plugin registration")
+    dr.add_argument("--online", action="store_true",
+                    help="also compare the local HEAD with the tip of the remote (needs the network)")
+    dr.set_defaults(func=cmd_doctor)
+
+    vn = sub.add_parser("version", help="print the version")
     vn.set_defaults(func=cmd_version)
 
     return p
@@ -768,7 +1381,7 @@ def main(argv: list[str]) -> int:
     try:
         return args.func(args)
     except KeyboardInterrupt:
-        err("\n[fail] 已中断")
+        err("\n[fail] interrupted")
         return 130
 
 

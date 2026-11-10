@@ -1,27 +1,32 @@
 #!/usr/bin/env bash
-# 从「脚本是从哪儿取来的」反推**源站** + 组织 + 仓库名
+# Derive the **source host** + org + repo name from "where this script came from".
 #
-# 硬编码 org/repo 意味着换组织、换 fork、换镜像站就得改代码。这里反过来：
-# 脚本从哪个 URL 拉下来，就用哪个源站 / 组织 / 仓库 —— 安装器因此是**自描述**的。
+# Hardcoding org/repo means changing the org, the fork or the mirror site
+# requires a code change. This goes the other way: whichever URL the script
+# was downloaded from decides the host / org / repo it uses — the installer is
+# therefore **self-describing**.
 #
-# 解析一个仓库 URL，输出 "<host> <org> <repo>"。支持：
+# Parse a repository URL and print "<host> <org> <repo>". Supported:
 #   https://github.com/<org>/<repo>
 #   https://github.com/<org>/<repo>/raw/<branch>/<path>
 #   https://github.com/<org>/<repo>/blob/<branch>/<path>
 #   https://raw.githubusercontent.com/<org>/<repo>/<branch>/<path>
 #   git@github.com:<org>/<repo>.git
-#   https://gitee.com/<org>/<repo>            ← 国内镜像
+#   https://gitee.com/<org>/<repo>            ← mirror
 #   https://gitee.com/<org>/<repo>/raw/<branch>/<path>
 #   git@gitee.com:<org>/<repo>.git
-#   http://<host>:<port>/<org>/<repo>.git     ← 内网 GitLab（端口在 host 里）
+#   http://<host>:<port>/<org>/<repo>.git     ← intranet GitLab (the port lives in the host)
 #
-# 规律：**路径的前两段永远是 org / repo**，后面的（raw/blob/分支/文件）一律丢掉。
-# 于是 GitHub 的 /raw/ 与 Gitee 的 /raw/ 用同一套解析，不用各写一份。
+# Rule: **the first two path segments are always org / repo**; everything
+# after them (raw / blob / branch / file) is dropped. That way GitHub's
+# /raw/ and Gitee's /raw/ share a single parser instead of one each.
 
-# 只读镜像 —— 内容由上游自动同步，推上去会被覆盖。
+# Read-only mirror — content is synced from upstream, pushes get overwritten.
 #
-# 这不是「风格偏好」，是**写错了会丢代码**：往镜像推的提交会在下一次同步时
-# 被上游版本覆盖，且没有任何提示。所以工具链必须知道哪个站不能推。
+# This is not a matter of style: pushing the wrong thing **loses code**. A
+# commit pushed to a mirror is overwritten by the upstream version on the
+# next sync, with no warning at all. The toolchain therefore has to know
+# which hosts must never be pushed to.
 wardner_host_is_readonly() {
     case "${1:-}" in
         gitee.com) return 0 ;;
@@ -29,20 +34,20 @@ wardner_host_is_readonly() {
     esac
 }
 
-# 源站主机名 → 人类可读的说明（给日志用）
+# Source host name → human-readable label (for logs)
 wardner_host_label() {
     case "${1:-}" in
         github.com) printf 'GitHub' ;;
-        gitee.com)  printf 'Gitee 镜像' ;;
+        gitee.com)  printf 'Gitee mirror' ;;
         *)           printf '%s' "${1:-?}" ;;
     esac
 }
 
-# 解析仓库 URL → "<host> <org> <repo>"。认不出来返回 1。
+# Parse a repository URL → "<host> <org> <repo>". Returns 1 when unparseable.
 parse_repo_url() {
-    local url="${1%%\?*}"            # 去掉 ?raw=1 之类的 query
-    url="${url%/}"                   # 去掉尾斜杠
-    url="${url%.git}"                # 去掉 .git
+    local url="${1%%\?*}"            # strip query strings like ?raw=1
+    url="${url%/}"                   # strip trailing slash
+    url="${url%.git}"                # strip .git
 
     local host="" path=""
     case "$url" in
@@ -57,20 +62,22 @@ parse_repo_url() {
             path="${url#ssh://*/}"
             ;;
         http://*/*|https://*/*)
-            # https://github.com/org/repo/...（内网 GitLab 的 host 里带端口）
+            # https://github.com/org/repo/... (an intranet GitLab host carries its port)
             host="${url#*://}"; host="${host%%/*}"
             path="${url#*://*/}"
             ;;
         *) return 1 ;;
     esac
 
-    # raw.githubusercontent.com 是**取文件**的域名，不是 clone 的域名 —— 归一成
-    # github.com，否则会推出一个不存在的 clone 源。
+    # raw.githubusercontent.com is the domain for **fetching files**, not for
+    # cloning — normalise it to github.com, otherwise we derive a clone URL
+    # that does not exist.
     case "$host" in
         raw.githubusercontent.com) host="github.com" ;;
     esac
 
-    # org / repo 必须是路径的前两段。少一段就认不出来（宁可失败也别猜）。
+    # org / repo must be the first two path segments. One segment short and
+    # we bail out (better to fail than to guess).
     case "$path" in
         */*) ;;
         *) return 1 ;;
@@ -84,14 +91,16 @@ parse_repo_url() {
     printf '%s %s %s\n' "$host" "$org" "$repo"
 }
 
-# 这个地址是「取文件地址」而不是「仓库地址」吗？
+# Is this URL a "file URL" rather than a "repository URL"?
 #
-# raw 取文件 URL 当 clone 地址用会**直接失败** —— git 会去找用户名要密码
-# （实测 "could not read Username for 'https://gitee.com'"；有 TTY 时更是
-# 直接卡在密码提示上，用户以为安装器挂了）。
+# Using a raw file URL as a clone URL **fails outright** — git asks for a
+# username (observed: "could not read Username for 'https://gitee.com'"), and
+# with a TTY it even hangs on the password prompt, so users think the
+# installer froze.
 #
-# ⚠️ install.sh 的 bootstrap 段里有一份**内联副本**（那时还没 source
-#    lib/urls.sh）—— **改一处必须改另一处**。
+# ⚠️ install.sh carries an **inline copy** of this in its bootstrap section
+#    (lib/urls.sh is not sourced yet at that point) — **change one, change
+#    the other**.
 source_url_is_file_url() {
     case "${1:-}" in
         */raw/*|*/blob/*) return 0 ;;
@@ -100,9 +109,10 @@ source_url_is_file_url() {
     return 1
 }
 
-# URL → host（只用来比较两个地址是不是同一个站）。
+# URL → host (used only to compare whether two URLs point at the same site).
 #
-# ⚠️ install.sh 的 bootstrap 段里有一份**内联副本** —— 改一处必须改另一处。
+# ⚠️ install.sh carries an **inline copy** of this in its bootstrap section
+#    — change one, change the other.
 source_url_host() {
     local u="${1:-}"
     case "$u" in
@@ -117,13 +127,13 @@ source_url_host() {
     esac
 }
 
-# 仓库的 git clone 地址
+# The git clone URL of a repository
 repo_clone_url() {
     repo_clone_url_for https "$@"
 }
 
-# 同上，但按指定协议来 —— 内网 GitLab 走 http、SSH 源走 git@ 形式，
-# 一律改成 https 会直接把 clone 弄坏。
+# Same, but with an explicit scheme — an intranet GitLab over http and an
+# SSH source need their own forms; forcing https breaks the clone.
 repo_clone_url_for() {
     local scheme="$1" host="$2" org="$3" repo="$4"
     case "$scheme" in
@@ -133,15 +143,17 @@ repo_clone_url_for() {
     esac
 }
 
-# 源站 → 传输协议
+# Source host → transport scheme
 #
-# * **GitHub / Gitee 走 https** —— 公开仓，匿名 clone 就行，不需要账号 /
-#   SSH key。这是「没登录过的用户也能装」的唯一路径。
-# * **内网走 ssh** —— 内网 GitLab 的 web 口在 8080，那是 HTTP 端口；走 ssh
-#   才是内网该有的取码方式。
+# * **GitHub / Gitee use https** — public repos, anonymous clone is enough,
+#   no account / SSH key required. This is the only path that works for
+#   users who have never logged in.
+# * **Intranet hosts use ssh** — an intranet GitLab serves its web UI on
+#   8080, which is an HTTP port; ssh is the right way to fetch the code.
 #
-# 协议由**源站**决定，不由取脚本用的 URL 协议决定：内网 GitLab 的
-# /raw/ 页面是 http 的，但代码要从 ssh 拉。
+# The scheme is decided by the **source host**, not by the scheme of the URL
+# the script was downloaded from: an intranet GitLab serves its /raw/ pages
+# over http, but the code has to come over ssh.
 source_scheme_for_host() {
     case "${1:-}" in
         github.com|gitee.com|"") printf 'https' ;;
@@ -149,13 +161,13 @@ source_scheme_for_host() {
     esac
 }
 
-# SSH 的 host 不带端口 —— web 的 8080 是 HTTP 端口，不是 SSH 端口。
-# 写成 git@10.10.10.10:8080:org/repo.git 是错的。
+# The SSH host carries no port — the web UI's 8080 is an HTTP port, not an
+# SSH port. Writing git@10.10.10.10:8080:org/repo.git is wrong.
 ssh_host() {
     printf '%s' "${1%%:*}"
 }
 
-# pip 的 VCS 前缀（update_rkwhl.sh 的 WARDNER_PKG_BASE 用）
+# The pip VCS prefix (used as WARDNER_PKG_BASE by update_rkwhl.sh)
 pkg_base_for() {
     local scheme="$1" host="$2" org="$3"
     case "$scheme" in
@@ -165,22 +177,28 @@ pkg_base_for() {
     esac
 }
 
-# 在 /proc 里翻 curl 的命令行，推断本脚本是从哪个 URL 取来的。
+# Scan /proc for curl's command line to infer which URL this script was
+# fetched from.
 #
-# `curl ... | bash` 时脚本自己并不知道来源。但 curl 通常还在跑（脚本还在
-# 从管道里读），它的 /proc/<pid>/cmdline 里带着完整 URL。
+# With `curl ... | bash` the script itself does not know the source. curl is
+# usually still running (the script is still reading from the pipe), and its
+# /proc/<pid>/cmdline carries the full URL.
 #
-# 只认命令行里含 "install.sh" 的 curl —— 免得把机器上别的 curl 命令
-# 认成自己（那会推出一个完全无关的组织名）。
+# Only curl command lines containing "install.sh" are considered — otherwise
+# an unrelated curl on the machine would be mistaken for ourselves (and
+# would yield a completely unrelated org name).
 detect_source_url() {
     local p cmd url
     for p in /proc/[0-9]*; do
-        # ⚠️ `2>/dev/null` 必须写在输入重定向**之前**，顺序不能反 —— bash 从左到右
-        # 执行重定向，进程刚好退出时 shell 自己报的重定向错误也会被吞掉。
-        # 写成 `< file 2>/dev/null`（反过来）会漏出 "No such file or directory"
-        # 噪音（扫几百个 pid 必撞 TOCTOU）。
+        # ⚠️ `2>/dev/null` must come **before** the input redirection — the
+        #    order cannot be reversed. bash applies redirections left to
+        #    right, so a process that exits right then has the shell's own
+        #    redirection error swallowed as well.
+        # Writing `< file 2>/dev/null` (reversed) leaks "No such file or
+        #    directory" noise (scanning hundreds of pids always hits TOCTOU).
         #
-        # 与 install.sh 的 bootstrap 段是**同一套逻辑** —— 改一处必须改另一处。
+        # This is the **same logic** as the bootstrap section of install.sh
+        # — change one, change the other.
         cmd="$(tr '\0' ' ' 2>/dev/null < "$p/cmdline")" || continue
         case "$cmd" in
             *curl*install.sh*) ;;

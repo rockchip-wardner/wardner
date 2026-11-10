@@ -1,60 +1,70 @@
 #!/usr/bin/env bash
-# wdnwebui 一键安装器 —— 公共配置与工具函数
+# wdnwebui one-shot installer — shared configuration and helper functions.
 #
-# 被 install.sh / update.sh source，**不要**直接执行。
+# Sourced by install.sh / update.sh — **do not** execute it directly.
 #
-# 板端没有 emoji / 符号字体：`🖼 ✕ ⚠ ✓ ☑ ▯ 🗑 📁` 全部渲染成豆腐块（□）。
-#    板端可用的只有 `× ● ■ ▶ ← → ↑ ↓` —— 下面的输出只用这些。
+# The board has no emoji / symbol font: 🖼 ✕ ⚠ ✓ ☑ ▯ 🗑 📁 all render as tofu
+# boxes (□). The only symbols that work on the board are `× ● ■ ▶ ← → ↑ ↓`
+# — the output below uses only those.
 
 # ---------------------------------------------------------------------------
-# 家目录
+# Home directory
 #
-# 脚本**不自行提权**，也不假设自己是被谁提权跑的 —— 家目录就是当前进程的
-# $HOME。谁跑安装器，wdn 命令就装给谁；缺权限时脚本只把要执行的命令打出来，
-# 由操作员自己以 root 身份跑。
+# The script **never elevates privileges** and does not assume who elevated
+# it — the home directory is the $HOME of the current process. Whoever runs
+# the installer is who gets the wdn command; when permissions are missing
+# the script only prints the commands to run, and the operator runs them as
+# root.
 # ---------------------------------------------------------------------------
 wardner_target_home() {
     printf '%s\n' "$HOME"
 }
 
 # ---------------------------------------------------------------------------
-# 配置（都可用环境变量覆盖，方便测试与定制）
+# Configuration (every value can be overridden by an environment variable,
+# which makes testing and customisation easy)
 #
-# WARDNER_SOURCE_HOST / WARDNER_ORG / WARDNER_REPO_NAME 由 install.sh 的
-# bootstrap 阶段**推断**出来（从脚本自身的来源 URL 反推，见 lib/urls.sh）——
-# 硬编码组织名的话，换个组织 / 换个 fork / 换个镜像站就得改代码。这里只是兜底默认值。
+# WARDNER_SOURCE_HOST / WARDNER_ORG / WARDNER_REPO_NAME are **inferred** by
+# the bootstrap phase of install.sh (from the URL the script itself came
+# from, see lib/urls.sh) — hardcoding the org name would mean changing the
+# code whenever the org, the fork or the mirror site changes. The values
+# here are only fallback defaults.
 #
-# 源站有两个：
-#   * github.com —— 权威仓库，可 push
-#   * gitee.com  —— 国内**只读镜像**，内容由上游自动同步，**不要往它推**
-# 从哪个站装的，宿主应用和 8 个 SDK / 插件包就都走哪个站（国内网络走 Gitee 快）。
+# There are two source hosts:
+#   * github.com — the authoritative repository, pushable
+#   * gitee.com  — a **read-only mirror**, synced from upstream, **never
+#                  push to it**
+# Whichever site you install from, the host app and the 8 SDK / plugin
+# packages all follow that site (Gitee is faster on mainland networks).
 # ---------------------------------------------------------------------------
 
-# 用户**显式**指定的包来源前缀（可能为空）。留个副本：resolve_source 会按
-# 源站重算 WARDNER_PKG_BASE，但没有这个副本，用户在环境变量里指定的
-# 内网镜像地址会被**静默覆盖** —— 那正是 README 里写明的用法。
+# The package source prefix **explicitly** set by the user (may be empty).
+# Keep a copy: resolve_source recomputes WARDNER_PKG_BASE from the source
+# host, and without this copy a mirror address the user set in the
+# environment would be **silently overwritten** — exactly the usage the
+# README documents.
 WARDNER_PKG_BASE_ENV="${WARDNER_PKG_BASE:-}"
 
-: "${WARDNER_HOME:=$(wardner_target_home)/.wardner}"   # 安装根目录
-: "${WARDNER_SOURCE_HOST:=github.com}"                # 源站（github.com / gitee.com）
-: "${WARDNER_SOURCE_SCHEME:=$(source_scheme_for_host "$WARDNER_SOURCE_HOST")}"  # 源站协议
-: "${WARDNER_ORG:=rockchip-wardner}"                  # 组织（由来源 URL 推断）
-: "${WARDNER_REPO_NAME:=wardner}"                     # 本仓名（由来源 URL 推断）
+: "${WARDNER_HOME:=$(wardner_target_home)/.wardner}"   # install root
+: "${WARDNER_SOURCE_HOST:=github.com}"                # source host (github.com / gitee.com)
+: "${WARDNER_SOURCE_SCHEME:=$(source_scheme_for_host "$WARDNER_SOURCE_HOST")}"  # source host scheme
+: "${WARDNER_ORG:=rockchip-wardner}"                  # org (inferred from the source URL)
+: "${WARDNER_REPO_NAME:=wardner}"                     # this repo (inferred from the source URL)
 : "${WARDNER_REPO_URL:=https://$WARDNER_SOURCE_HOST/$WARDNER_ORG/$WARDNER_REPO_NAME.git}"
-: "${WARDNER_HOST_REPO:=wdnwebui}"                    # 宿主应用仓名
+: "${WARDNER_HOST_REPO:=wdnwebui}"                    # host application repo name
 : "${WARDNER_PKG_BASE:=git+https://$WARDNER_SOURCE_HOST/$WARDNER_ORG}"
 : "${WARDNER_PYTHON:=python3}"
 : "${WARDNER_BRANCH:=master}"
 
 WARDNER_HOME="${WARDNER_HOME%/}"
-WARDNER_REPO_DIR="$WARDNER_HOME/$WARDNER_REPO_NAME"              # 本仓
-WARDNER_HOST_DIR="$WARDNER_HOME/$WARDNER_HOST_REPO"               # 宿主应用
-WARDNER_VENV="$WARDNER_HOST_DIR/.venv"                         # 虚拟环境
-WARDNER_VENV_SRC="$WARDNER_VENV/src"                           # SDK / 插件包
+WARDNER_REPO_DIR="$WARDNER_HOME/$WARDNER_REPO_NAME"              # this repo
+WARDNER_HOST_DIR="$WARDNER_HOME/$WARDNER_HOST_REPO"               # host application
+WARDNER_VENV="$WARDNER_HOST_DIR/.venv"                         # virtual environment
+WARDNER_VENV_SRC="$WARDNER_VENV/src"                           # SDK / plugin packages
 WARDNER_PACKAGES_CONF="${WARDNER_PACKAGES_CONF:-$SCRIPT_DIR/packages.conf}"
 
 # ---------------------------------------------------------------------------
-# 输出
+# Output
 # ---------------------------------------------------------------------------
 if [ -t 2 ] && [ -z "${NO_COLOR:-}" ]; then
     C_RED=$'\033[1;31m'; C_GRN=$'\033[1;32m'; C_YEL=$'\033[1;33m'
@@ -72,39 +82,43 @@ die()  { printf '\n%s[fail]%s %s\n' "$C_RED" "$C_RST" "$*" >&2; exit 1; }
 note() { printf '  %s%s%s\n' "$C_DIM" "$*" "$C_RST" >&2; }
 
 # ---------------------------------------------------------------------------
-# 工具
+# Helpers
 # ---------------------------------------------------------------------------
 need_cmd() {
     local c="$1" hint="${2:-}"
     command -v "$c" >/dev/null 2>&1 && return 0
-    die "缺少命令 '$c'${hint:+ —— $hint}"
+    die "missing command '$c'${hint:+ — $hint}"
 }
 
 # ---------------------------------------------------------------------------
-# git 重试
+# git retries
 #
-# 一键安装最怕的就是「网络抖一下，整套装失败」：GitHub 在部分网络下会
-# GnuTLS recv error / connection reset / RPC failed，clone 到一半断掉。
-# 这类失败重试一次通常就成了，所以重试几次再判死刑。
+# The worst thing about a one-shot installer is "the network hiccuped and
+# the whole install failed": GitHub may throw GnuTLS recv error / connection
+# reset / RPC failed on some networks, and the clone dies halfway through.
+# Retrying once usually works, so retry a few times before giving up.
 #
-# 永久性失败（本地与远端分叉）重试也没用，但重试次数少、间隔短，
-# 代价可以接受 —— 真正报错的信息在最后一次尝试里是完整可见的。
+# Permanent failures (local and remote have diverged) never get better with
+# retries, but a small number of retries with short intervals costs little —
+# the real error message is fully visible in the last attempt anyway.
 #
-# ⚠️ **只走 HTTPS**，不提供 SSH 回退：公网用户大多没配 GitHub SSH key，
-#    走 SSH 只会卡在 "Permission denied (publickey)" / 密码提示上。
-#    公开仓的 HTTPS 匿名 clone 是唯一对「没登录的人」友好的路径。
+# ⚠️ **HTTPS only**, no SSH fallback: most public users have no GitHub SSH
+#    key, and SSH just hangs on "Permission denied (publickey)" / a password
+#    prompt. Anonymous HTTPS clone of a public repo is the only path that is
+#    friendly to people who have never logged in.
 #
-# lowSpeedLimit/lowSpeedTime：git 默认**没有**连接超时，TCP 层的失败要等
-# 135s 才报出来（实测 "Failed to connect ... after 135137 ms"）。这在
-# 9 个仓的安装里意味着一次抖动就要等十几分钟。设成「30 秒内不到 1 字节
-# 就 abort」把失败尝试压到 30s，配合重试总耗时可控。
+# lowSpeedLimit/lowSpeedTime: git has **no** connect timeout by default, so a
+# TCP-level failure takes 135s to surface (observed: "Failed to connect ...
+# after 135137 ms"). Across a 9-repo install that is minutes wasted on a
+# single hiccup. Aborting after "30s without a single byte" caps each failed
+# attempt at 30s, which keeps the total time bounded together with retries.
 # ---------------------------------------------------------------------------
 : "${WARDNER_GIT_RETRY:=5}"
 : "${WARDNER_RETRY_DELAY:=5}"
 : "${WARDNER_GIT_LOW_SPEED_LIMIT:=1}"
 : "${WARDNER_GIT_LOW_SPEED_TIME:=30}"
 
-# git 的网络参数（放在子命令前）
+# git network options (must come before the subcommand)
 GIT_NET_OPTS=(
     -c "http.lowSpeedLimit=$WARDNER_GIT_LOW_SPEED_LIMIT"
     -c "http.lowSpeedTime=$WARDNER_GIT_LOW_SPEED_TIME"
@@ -120,56 +134,60 @@ git_retry() {
         if [ "$attempt" -ge "$WARDNER_GIT_RETRY" ]; then
             return 1
         fi
-        warn "$label 失败（第 ${attempt}/${WARDNER_GIT_RETRY} 次），${WARDNER_RETRY_DELAY}s 后重试"
+        warn "$label failed (attempt ${attempt}/${WARDNER_GIT_RETRY}), retrying in ${WARDNER_RETRY_DELAY}s"
         attempt=$((attempt + 1))
         sleep "$WARDNER_RETRY_DELAY"
     done
 }
 
-# 克隆或快进一个仓库。已存在则 pull --ff-only（本地有改动 / 分叉时不硬来）。
-# $1 = 目标目录  $2 = 仓库名
+# Clone a repository, or fast-forward it when it already exists (never force
+# a repo with local changes or diverged history).
+# $1 = target directory  $2 = repository name
 #
-# ⚠️ clone 地址跟着**源站**走 —— 从 Gitee 装的，8 个包也走 Gitee（国内快）。
-#    协议也跟着源站：内网 GitLab 走 http://10.10.10.10:8080/... 时，写死
-#    https 会直接连不上。
+# ⚠️ The clone URL follows the **source host** — an install from Gitee also
+#    pulls the 8 packages from Gitee (faster on mainland networks).
+#    The scheme follows the source host as well: an intranet GitLab reached
+#    as http://10.10.10.10:8080/... must not be hardcoded to https.
 fetch_repo() {
     local dir="$1" name="$2"
     local url
     url="$(repo_clone_url_for "$WARDNER_SOURCE_SCHEME" "$WARDNER_SOURCE_HOST" "$WARDNER_ORG" "$name")"
 
     if [ -d "$dir/.git" ]; then
-        # 换源时把 remote 指到新源 —— `git pull` **不会**改 remote URL，
-        # 不改的话源站永远停在第一次装的那个。
+        # When the source host changes, point the remote at the new one —
+        # `git pull` **does not** rewrite the remote URL, so without this the
+        # source host would stay stuck at whatever was installed first.
         local old_remote new_host
         old_remote="$(git -C "$dir" remote get-url origin 2>/dev/null || true)"
         new_host="$(source_url_host "$old_remote")"
         if [ -n "$old_remote" ] && [ "$new_host" != "$WARDNER_SOURCE_HOST" ]; then
             git -C "$dir" remote set-url origin "$url" >/dev/null 2>&1 || true
-            log "$name 的 remote 已切到新源： $url"
+            log "remote of $name switched to the new source: $url"
         fi
 
-        log "更新 $name"
+        log "updating $name"
         if ! git_retry "git pull $name" \
             git -C "$dir" "${GIT_NET_OPTS[@]}" pull --ff-only; then
-            warn "$name 本地与远端已分叉（或有未提交改动），跳过更新"
-            warn "  手工处理： git -C $dir status"
+            warn "$name has diverged from the remote (or has uncommitted changes), skipping the update"
+            warn "  handle it manually: git -C $dir status"
             return 1
         fi
         return 0
     fi
 
-    log "克隆 $name"
+    log "cloning $name"
     mkdir -p "$(dirname "$dir")"
     rm -rf "$dir"
     if ! git_retry "git clone $name" \
         git "${GIT_NET_OPTS[@]}" clone --branch "$WARDNER_BRANCH" "$url" "$dir"; then
-        die "克隆 $name 失败： $url"
+        die "cloning $name failed: $url"
     fi
 }
 
-# 读 packages.conf 的每一行 → "pkg<TAB>repo"。跳过空行与 # 注释。
+# Read every line of packages.conf → "pkg<TAB>repo". Skips blank lines and
+# # comments.
 read_packages() {
-    [ -f "$WARDNER_PACKAGES_CONF" ] || die "找不到包清单 $WARDNER_PACKAGES_CONF"
+    [ -f "$WARDNER_PACKAGES_CONF" ] || die "package list not found: $WARDNER_PACKAGES_CONF"
     while read -r pkg repo _rest; do
         [ -z "${pkg:-}" ] && continue
         case "$pkg" in \#*) continue ;; esac
@@ -179,22 +197,24 @@ read_packages() {
 }
 
 # ---------------------------------------------------------------------------
-# wdn 命令：装到 PATH + 写进 ~/.bashrc
+# The wdn command: put it on PATH + write it into ~/.bashrc
 #
-# 「让当前用户直接用 wdn」要两件事：
-#   1. 命令本身在 PATH 上 —— 放两处：
-#        $WARDNER_HOME/<repo>/bin/wdn   （真身，bashrc 加进 PATH）
-#        ~/.local/bin/wdn               （symlink，给不读 bashrc 的场景兜底）
-#   2. 环境的来源写进 ~/.bashrc —— 托管块形式，带起止标记，重复安装会
-#      **替换**旧块而不是追加两份。
+# "Let the current user run wdn directly" takes two things:
+#   1. The command itself on the PATH — in two places:
+#        $WARDNER_HOME/<repo>/bin/wdn   (the real one, added to the PATH by bashrc)
+#        ~/.local/bin/wdn               (symlink, for shells that don't read bashrc)
+#   2. The environment it needs written into ~/.bashrc — as a managed block
+#      with begin/end markers, so a repeated install **replaces** the old
+#      block instead of appending a second copy.
 #
-# 托管块而不是裸的一行 PATH：用户自己的 ~/.bashrc 会被后续的安装反复改，
-# 没有标记就没法安全地改回来。
+# A managed block rather than a bare PATH line: the user's own ~/.bashrc gets
+# rewritten by every install, and without markers there is no safe way to
+# change it back.
 # ---------------------------------------------------------------------------
 WARDNER_BASHRC_BEGIN="# >>> wardner (wdn) >>>"
 WARDNER_BASHRC_END="# <<< wardner (wdn) <<<"
 
-# 写（或替换）~/.bashrc 里的托管块。幂等。
+# Write (or replace) the managed block in ~/.bashrc. Idempotent.
 wardner_write_bashrc() {
     local rc="$1" home="$2" bindir="$3"
     local begin="$WARDNER_BASHRC_BEGIN" end="$WARDNER_BASHRC_END"
@@ -206,8 +226,9 @@ wardner_write_bashrc() {
     mkdir -p "$(dirname "$rc")"
     [ -f "$rc" ] || : > "$rc"
 
-    # 只在**两个标记都在**的时候才删旧块 —— 只剩 begin 标记说明上次写坏了，
-    # 这时宁可不动，也别把用户 bashrc 后面的内容一起吃掉。
+    # Only delete the old block when **both markers are present** — a lone
+    # begin marker means the last write was broken, and in that case it is
+    # safer to leave the file alone than to swallow whatever follows it.
     if grep -qF "$begin" "$rc" && grep -qF "$end" "$rc"; then
         local tmp
         tmp="$(mktemp)"
@@ -219,7 +240,7 @@ wardner_write_bashrc() {
             mv "$tmp" "$rc"
         else
             rm -f "$tmp"
-            warn "改写 ~/.bashrc 失败 —— 保留原样，请手工加入 PATH： $bindir"
+            warn "could not rewrite ~/.bashrc — left it as it is, please add the PATH manually: $bindir"
             return 1
         fi
     fi
@@ -227,8 +248,8 @@ wardner_write_bashrc() {
     cat >> "$rc" <<EOF
 
 $begin
-# 由 wardner install.sh 写入 —— 让当前用户直接用 wdn 命令。
-# 删掉这一段不影响安装，只是 wdn 得用全路径调。
+# Written by wardner install.sh — puts the wdn command on this user's PATH.
+# Removing this block does not break the install; you just have to call wdn by its full path.
 export WARDNER_HOME="$home"
 case ":\$PATH:" in
   *":$bindir:"*) ;;
@@ -238,4 +259,3 @@ $end
 EOF
     return 0
 }
-

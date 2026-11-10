@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
-# 真实端到端：按用户的方式跑入口脚本（curl | bash），验证「源站」判定。
+# Real end-to-end check: run the entry script the way a user does
+# (curl | bash) and verify how the "source site" is selected.
 #
-# 只跑到「源：」那一行就掐断（Phase 2 之后是建 venv + 装 8 个包，没必要），
-# 全程在临时 WARDNER_HOME 里跑，**不碰** ~/.wardner 里的真实安装。
+# It stops at the "source:" line (everything after phase 2 is creating the
+# venv + installing the 8 packages, which is not needed here), and it runs
+# entirely inside a temporary WARDNER_HOME, so it **never touches** the
+# real installation in ~/.wardner.
 #
-# 用法：bash scripts/verify_e2e_source.sh <github|gitee>
+# Usage: bash scripts/verify_e2e_source.sh <github|gitee>
 set -uo pipefail
 
 WHICH="${1:-gitee}"
@@ -14,20 +17,20 @@ trap 'rm -rf "$E2E_HOME"' EXIT
 case "$WHICH" in
     github) URL="https://github.com/rockchip-wardner/wardner/raw/master/install_github.sh" ;;
     gitee)  URL="https://gitee.com/rockchip-wardner/wardner/raw/master/install_gitee.sh" ;;
-    *)      echo "用法: $0 <github|gitee>"; exit 2 ;;
+    *)      echo "usage: $0 <github|gitee>"; exit 2 ;;
 esac
 
-echo "入口: $URL"
-echo "临时安装根: $E2E_HOME"
+echo "entry point: $URL"
+echo "temporary install root: $E2E_HOME"
 echo
 
 export WARDNER_HOME="$E2E_HOME"
 
-# 与真实用户完全一样的姿势：curl | bash
+# Exactly the way a real user does it: curl | bash
 curl -fsSL --max-time 60 "$URL" | timeout 240 bash 2>&1 | sed -n '1,60p'
 rc=${PIPESTATUS[1]}
 
 echo
-echo "--- 判定 ---"
-echo "临时仓的 remote:"
+echo "--- verdict ---"
+echo "the remote of the temporary repo:"
 git -C "$E2E_HOME/wardner" remote get-url origin 2>&1 | sed 's/^/  /'

@@ -1,5 +1,6 @@
-# 本仓只放安装器本身，没有需要忽略的东西 —— 但留个 .gitignore 免得以后
-# 加脚本时被临时文件污染。
+# This repo only holds the installer itself, there is nothing to ignore —
+# but the .gitignore stays so that adding a script later does not let
+# temporary files slip into a commit.
 
 *.log
 *.swp

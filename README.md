@@ -203,9 +203,9 @@ headers needed to build the `.so` of `wdndds`), it only prints the commands to r
 as-is, for you to run yourself as root:
 
 ```
-× 缺编译依赖： cmake build-essential patchelf libfoonathan-memory-dev
-× wdndds 的 .so 可能编不出来（算力页会报「功能未启用」）。
-× 请以 root 身份执行下面三条，然后重跑本脚本补编：
+× missing build dependencies: cmake build-essential patchelf libfoonathan-memory-dev
+× the .so of wdndds may fail to build (the compute page will report "feature not enabled").
+× run the three commands below as root, then re-run this script to build the rest:
 ×   apt-get update
 ×   apt-get install -y cmake build-essential patchelf libfoonathan-memory-dev
 ×   bash ~/.wardner/wdnwebui/update_rkwhl.sh
@@ -346,7 +346,7 @@ cd ~/.wardner/wdnwebui
 ```
 
 **The source is wrong (you installed from Gitee, but the preflight says
-`源： github.com/…`).** Check that you used the **entry script**: `install_gitee.sh`
+`source: github.com/…`).** Check that you used the **entry script**: `install_gitee.sh`
 is the Gitee source; `install.sh` is the internal implementation and carries **no**
 source declaration (it can only guess, and when the guess fails it falls back to
 GitHub with a warning):

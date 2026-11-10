@@ -1,52 +1,62 @@
 #!/usr/bin/env bash
-# wdnwebui 一键安装器
+# wdnwebui one-shot installer
 #
-#   ── GitHub（默认）────────────────────────────────────────────
+#   ── GitHub (default) ───────────────────────────────────────────
 #   curl -fsSL https://github.com/rockchip-wardner/wardner/raw/master/install_github.sh | bash
 #
-#   ── Gitee 国内镜像（国内网络更快）────────────────────────────
+#   ── Gitee mirror (faster on mainland networks) ─────────────────
 #   curl -fsSL https://gitee.com/rockchip-wardner/wardner/raw/master/install_gitee.sh | bash
 #
-# ⚠️ 注意是 **/raw/master/**，不能写成 .../wardner/install.sh —— 那是网页路由，
-#    不是原始文件地址（curl 会拿到 404 或一段 HTML）。
+# ⚠️ Note the **/raw/master/** path — do not write .../wardner/install.sh,
+#    that is a web route, not the raw file URL (curl gets a 404 or a page of
+#    HTML).
 #
-# 安装器**知道自己属于哪个站**：源站由**入口脚本**声明 ——
-# install_github.sh / install_gitee.sh 各自声明 GitHub / Gitee 源，
-# 真正的安装逻辑在 install.sh（两个入口脚本只是薄壳，逻辑只有一份）。
+# The installer **knows which site it belongs to**: the source site is
+# declared by the **entry script** — install_github.sh / install_gitee.sh
+# declare GitHub / Gitee respectively, while the real installation logic
+# lives in install.sh (the two entry scripts are thin shells, the logic
+# exists only once).
 #
-# 从哪个源装的，宿主应用和 8 个 SDK / 插件包、以及后续的 `wdn update`
-# 全都跟着走。
+# Whichever site you install from, the host application, the 8 SDK / plugin
+# packages and every later `wdn update` follow that same site.
 #
-# ⚠️ Gitee 是**只读镜像**（内容由上游自动同步）—— 从它拉没问题，**不要往它推**。
-#    需要推送请用 GitHub（或内网主仓库）。
+# ⚠️ Gitee is a **read-only mirror** (content is synced from upstream) —
+#    pulling from it is fine, **never push to it**. Use GitHub (or the
+#    intranet primary repo) to push.
 #
-# 装到 ~/.wardner 下：
+# Everything lands under ~/.wardner:
 #
-#   ~/.wardner/wardner/                    本仓（安装器自身，便于日后更新）
-#   ~/.wardner/wdnwebui/                   宿主应用（FastAPI 服务 + 卡片宿主）
-#   ~/.wardner/wdnwebui/.venv/             虚拟环境
-#   ~/.wardner/wdnwebui/.venv/src/<pkg>/   8 个 SDK / 卡片插件包（各自独立 git 仓）
+#   ~/.wardner/wardner/                    this repo (the installer itself, so it can update itself later)
+#   ~/.wardner/wdnwebui/                   host application (FastAPI service + card host)
+#   ~/.wardner/wdnwebui/.venv/             virtual environment
+#   ~/.wardner/wdnwebui/.venv/src/<pkg>/   the 8 SDK / card plugin packages (each its own git repo)
 #
-# 幂等：重跑一次 = 拉最新 + 重装。HEAD 没变的包会跳过重装（见 update_rkwhl.sh）。
+# Idempotent: running it again = pull the latest + reinstall. Packages whose
+# HEAD did not change are skipped (see update_rkwhl.sh).
 #
-# 实际装包、产物校验、依赖审计都交给 wdnwebui 仓里的 update_rkwhl.sh —— 那
-# 470 行是在板子上打磨出来的（.so 落地断言、editable 残留清理、卡片注册校验、
-# SDK 声明依赖审计），这里**不重复实现**，只负责把代码拉到该在的位置。
+# Installing the packages, verifying the artifacts and auditing the
+# dependencies are all delegated to update_rkwhl.sh in the wdnwebui repo —
+# those 470 lines were refined on real boards (.so landing assertions,
+# editable-install leftovers, card registration checks, SDK dependency
+# audits), so this script **does not reimplement** them; it only moves the
+# code to where it belongs.
 
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
-# 来源 URL 判定工具
+# Source URL helpers
 #
-# 这两个函数在 bootstrap 阶段就要用（那时 lib/urls.sh 还没 source），所以
-# 这里内联了一份 —— lib/urls.sh 里是**同套逻辑的副本**，**改一处必须改另一处**。
+# These two functions are needed during the bootstrap phase (lib/urls.sh is
+# not sourced yet at that point), so a copy lives here — lib/urls.sh holds
+# the **same logic**, and **changing one means changing the other**.
 # ---------------------------------------------------------------------------
 
-# 这个地址是「取文件地址」而不是「仓库地址」吗？
+# Is this URL a "file URL" rather than a "repository URL"?
 #
-# raw 取文件 URL 当 clone 地址用会**直接失败** —— git 会去找用户名要密码
-# （实测 "could not read Username for 'https://gitee.com'"；有 TTY 时更是
-# 直接卡在密码提示上，用户以为安装器挂了）。
+# Using a raw file URL as a clone URL **fails outright** — git asks for a
+# username (observed: "could not read Username for 'https://gitee.com'"), and
+# with a TTY it even hangs on the password prompt, so users think the
+# installer froze.
 source_url_is_file_url() {
     case "${1:-}" in
         */raw/*|*/blob/*) return 0 ;;
@@ -55,7 +65,7 @@ source_url_is_file_url() {
     return 1
 }
 
-# URL → host（只用来比较两个地址是不是同一个站）。
+# URL → host (used only to compare whether two URLs point at the same site).
 source_url_host() {
     local u="${1:-}"
     case "$u" in
@@ -73,17 +83,21 @@ source_url_host() {
 # ---------------------------------------------------------------------------
 # Phase 0: bootstrap
 #
-# `curl | bash` 时本文件并不在磁盘上 —— BASH_SOURCE 指向的是 "bash"，拿不到
-# 真实的脚本目录，也就 source 不了 lib/。所以第一件事是把本仓克隆到本地，
-# 然后 exec 克隆出来的那份：那份有真实的 SCRIPT_DIR。
+# With `curl | bash` this file is not on disk — BASH_SOURCE points at
+# "bash", so the real script directory is unknown and lib/ cannot be
+# sourced. So the first thing to do is clone this repo locally and then
+# exec the cloned copy: that one has a real SCRIPT_DIR.
 #
-# WARDNER_BOOTSTRAPPED 是防递归哨兵 —— 克隆版带着它跑，就不会再次 bootstrap。
+# WARDNER_BOOTSTRAPPED is the anti-recursion sentinel — the cloned copy
+# carries it and therefore does not bootstrap again.
 # ---------------------------------------------------------------------------
 if [ -z "${WARDNER_BOOTSTRAPPED:-}" ]; then
-    # 安装根目录默认放在当前用户的家目录下。
+    # The install root defaults to the home directory of the current user.
     #
-    # 脚本**不自行提权** —— 缺权限时只把命令打出来让操作员自己以 root 身份
-    # 跑。所以「谁跑安装器，wdn 命令就装给谁」：家目录就是 $HOME。
+    # The script **never elevates privileges** — when permissions are
+    # missing it only prints the command so the operator can run it as root
+    # themselves. So "whoever runs the installer is who gets the wdn
+    # command": the home directory is $HOME.
     if [ -z "${WARDNER_HOME:-}" ]; then
         WARDNER_HOME="$HOME/.wardner"
     fi
@@ -95,34 +109,45 @@ if [ -z "${WARDNER_BOOTSTRAPPED:-}" ]; then
     _repo_dir=""
 
     if ! command -v git >/dev/null 2>&1; then
-        printf '\033[1;31m[fail]\033[0m 缺少 git，请先安装（apt install git）\n' >&2
+        printf '\033[1;31m[fail]\033[0m git is missing, please install it first (apt install git)\n' >&2
         exit 1
     fi
 
-    # ── 推断「脚本是从哪儿取来的」──────────────────────────────────────
+    # ── Infer "where was this script fetched from" ─────────────────────
     #
-    # 硬编码 org/repo 意味着换组织 / 换 fork 就得改代码。这里反过来：从
-    # 来源 URL 反推**源站** + 组织 + 仓库名 —— 安装器因此是**自描述**的。
+    # Hardcoding org/repo means changing the org or the fork requires a
+    # code change. This goes the other way: the **source site** + org +
+    # repo name are derived from the source URL — the installer is
+    # therefore **self-describing**.
     #
-    # 来源优先级：
-    #   1. WARDNER_REPO_URL 环境变量 —— 用户显式指定，最高
-    #   2. WARDNER_SELF_SOURCE_URL —— **入口脚本自带**（install_github.sh /
-    #      install_gitee.sh 各自声明自己的源）。这是**主路径**
-    #   3. 已安装仓的 remote —— 续装 / update.sh 时以现状为准，不换源
-    #   4. curl 的命令行 —— 兜底（`curl ... | bash` 时 curl 常已退出）
-    #   5. 内置兜底 —— 会**告警**，绝不静默换源
+    # Source priority:
+    #   1. WARDNER_REPO_URL environment variable — explicitly set by the
+    #      user, highest priority
+    #   2. WARDNER_SELF_SOURCE_URL — **carried by the entry script**
+    #      (install_github.sh / install_gitee.sh declare their own source).
+    #      This is the **main path**
+    #   3. The remote of the already installed repo — for a reinstall or
+    #      update.sh the current state wins, the source is never switched
+    #   4. curl's command line — fallback (with `curl ... | bash` curl has
+    #      usually exited by then)
+    #   5. The built-in fallback — **warns**, never switches source silently
     #
-    # ⚠️ 第 2 条是主路径，因为 `curl ... | bash` 时脚本**可靠地**知道自己从
-    #    哪来，靠的不是运行时探测，而是**文件内容**：install.sh 只有 ~25KB，
-    #    一次就能塞进管道缓冲区，curl 写完立刻退出，等脚本扫 /proc 时 curl
-    #    早就没了（实测 24KB 脚本 → /proc 里没有 curl；200KB → 还在）。
-    #    所以「入口脚本声明源站」比「扫 /proc 猜源站」可靠得多 —— 第 4 条
-    #    只是历史兜底。
+    # ⚠️ Priority 2 is the main path, because with `curl ... | bash` the
+    #    script **reliably** knows where it came from — not by probing the
+    #    runtime, but by **file content**: install.sh is only ~25KB, so it
+    #    fits into the pipe buffer in one go; curl exits as soon as it has
+    #    written it, and by the time the script scans /proc curl is long
+    #    gone (observed: a 24KB script → no curl in /proc; 200KB → still
+    #    there).
+    #    So "the entry script declares the source site" is far more
+    #    reliable than "scan /proc and guess" — priority 4 is only a
+    #    historical fallback.
     #
-    # ⚠️ 这段在 source lib/*.sh **之前**跑（那时还不知道脚本目录），
-    #    所以 url 解析逻辑在这里内联了一份 —— lib/urls.sh 是同套逻辑的副本，
-    #    **改一处必须改另一处**。
-    # >>> 来源解析开始（scripts/verify_source_selection.sh 按这两个标记抽取本段做回归）
+    # ⚠️ This runs **before** sourcing lib/*.sh (the script directory is
+    #    not known yet), so a copy of the URL parsing logic lives here —
+    #    lib/urls.sh holds the same logic, and **changing one means changing
+    #    the other**.
+    # >>> source resolution begins (scripts/verify_source_selection.sh extracts this block by these two markers for regression testing)
     _src=""
     _src_kind=""
     if [ -n "${WARDNER_REPO_URL:-}" ]; then
@@ -132,21 +157,26 @@ if [ -z "${WARDNER_BOOTSTRAPPED:-}" ]; then
         _src="$WARDNER_SELF_SOURCE_URL"
         _src_kind="self"
     elif [ -d "$WARDNER_HOME/${WARDNER_REPO_NAME:-wardner}/.git" ]; then
-        # 已经装过了 —— 以**现有 remote** 为准（remote 是事实，推断归推断）。
-        # 这条让 update.sh / 重跑安装器**不会**把源站换掉。
+        # Already installed — the **existing remote** wins (the remote is a
+        # fact, an inference is not).
+        # This keeps update.sh / a reinstall from switching the source site.
         _src="$(git -C "$WARDNER_HOME/${WARDNER_REPO_NAME:-wardner}" \
                     remote get-url origin 2>/dev/null || true)"
         [ -n "$_src" ] && _src_kind="installed"
     fi
     if [ -z "$_src" ]; then
         for _p in /proc/[0-9]*; do
-            # ⚠️ `2>/dev/null` 必须写在输入重定向**之前**，顺序不能反。
+            # ⚠️ `2>/dev/null` must come **before** the input redirection —
+            #    the order cannot be reversed.
             #
-            # bash 按**从左到右**执行重定向：先把 stderr 换成 /dev/null，之后输入
-            # 重定向失败时 shell **自己**报的那句 "No such file or directory" 也
-            # 一并被吞掉。写成 `< file 2>/dev/null`（反过来）就漏出这行噪音 ——
-            # 扫几百个 pid，总有刚退出的（TOCTOU：glob 展开后进程就死了，
-            # /proc/<pid> 被内核摘掉），用户会以为安装出错了。
+            # bash applies redirections left to right: it swaps stderr for
+            # /dev/null first, so when the input redirection fails the
+            # shell's own "No such file or directory" message is swallowed
+            # as well. Writing `< file 2>/dev/null` (reversed) leaks that
+            # line of noise — scanning hundreds of pids always hits a
+            # process that just exited (TOCTOU: the glob is expanded and the
+            # process is gone, /proc/<pid> is removed by the kernel), and
+            # users think the install failed.
             _cmd="$(tr '\0' ' ' 2>/dev/null < "$_p/cmdline")" || continue
             case "$_cmd" in *curl*install.sh*) ;; *) continue ;; esac
             _u="$(printf '%s\n' "$_cmd" | grep -oE 'https?://[^ ]+' | head -1)"
@@ -156,20 +186,22 @@ if [ -z "${WARDNER_BOOTSTRAPPED:-}" ]; then
     if [ -z "$_src" ]; then
         _src="https://github.com/rockchip-wardner/wardner/raw/master/install.sh"
         _src_kind="default"
-        # 兜底**必须告警** —— 静默换源是本脚本最难查的一类 bug：
-        # 用户从 Gitee 装，却悄悄从 GitHub 拉，而且没有任何提示。
-        printf '\033[1;33m[warn]\033[0m 没能确定来源 URL（/proc 里找不到 curl —— 它在脚本读完前就退出了）\n' >&2
-        printf '       将使用内置默认源： github.com/rockchip-wardner/wardner\n' >&2
-        printf '       要用别的源，请用对应的**入口脚本**（源站由脚本名声明）：\n' >&2
-        printf '         install_github.sh  →  GitHub 源\n' >&2
-        printf '         install_gitee.sh   →  Gitee 源\n' >&2
-        printf '       或显式指定： export WARDNER_REPO_URL=https://<host>/<org>/<repo>.git\n' >&2
+        # The fallback **must warn** — switching source silently is one of
+        # the hardest bugs to track down here: the user installs from Gitee
+        # but silently pulls from GitHub, with no hint at all.
+        printf '\033[1;33m[warn]\033[0m could not determine the source URL (no curl in /proc — it exited before the script was read)\n' >&2
+        printf '       falling back to the built-in default source: github.com/rockchip-wardner/wardner\n' >&2
+        printf '       to use another source, use the matching **entry script** (the script name declares the source site):\n' >&2
+        printf '         install_github.sh  →  GitHub source\n' >&2
+        printf '         install_gitee.sh   →  Gitee source\n' >&2
+        printf '       or set it explicitly: export WARDNER_REPO_URL=https://<host>/<org>/<repo>.git\n' >&2
     fi
 
-    # 解析来源 URL → "<host> <org> <repo>"。
+    # Parse the source URL → "<host> <org> <repo>".
     #
-    # 规律：**路径的前两段永远是 org / repo**，后面的（raw / blob / 分支 / 文件）
-    # 一律丢掉 —— 于是 GitHub 的 /raw/ 与 Gitee 的 /raw/ 用同一套解析。
+    # Rule: **the first two path segments are always org / repo**, anything
+    # after them (raw / blob / branch / file) is dropped — so GitHub's
+    # /raw/ and Gitee's /raw/ share one parser.
     _u="${_src%%\?*}"
     _u="${_u%/}"
     _u="${_u%.git}"
@@ -188,7 +220,8 @@ if [ -z "${WARDNER_BOOTSTRAPPED:-}" ]; then
             _path="${_u#*://*/}"
             ;;
     esac
-    # raw.githubusercontent.com 是**取文件**的域名，不是 clone 的域名
+    # raw.githubusercontent.com is the domain for **fetching files**, not for
+    # cloning
     case "$_host" in
         raw.githubusercontent.com) _host="github.com" ;;
     esac
@@ -204,8 +237,11 @@ if [ -z "${WARDNER_BOOTSTRAPPED:-}" ]; then
         _host="github.com"; _org="rockchip-wardner"; _repo="wardner"
     fi
 
-    # 用户显式设的（环境变量）**覆盖**解析结果 —— 与 README 的环境变量表一致。
-    # 之前是无条件覆盖，用户 export 了也没用（只有 wdn update 阶段有效）。
+    # What the user set explicitly (environment variables) **overrides** the
+    # parsed result — consistent with the environment variable table in the
+    # README.
+    # Previously it was an unconditional override, so exporting it had no
+    # effect (it only worked during the `wdn update` phase).
     _env_override=0
     if [ -n "${WARDNER_SOURCE_HOST:-}" ] || [ -n "${WARDNER_ORG:-}" ] \
        || [ -n "${WARDNER_REPO_NAME:-}" ]; then
@@ -219,11 +255,14 @@ if [ -z "${WARDNER_BOOTSTRAPPED:-}" ]; then
     _repo="$WARDNER_REPO_NAME"
 
     WARDNER_SOURCE_HOST="$_host"
-    # 协议由**源站**决定：GitHub / Gitee 走 https（公开仓，匿名 clone），
-    # 内网走 ssh（内网 GitLab 的 web 口在 8080，那是 HTTP 端口，取码用 ssh）。
+    # The scheme is decided by the **source site**: GitHub / Gitee use https
+    # (public repos, anonymous clone), intranet hosts use ssh (the web port
+    # of an intranet GitLab is 8080, an HTTP port, so fetching the code uses
+    # ssh).
     #
-    # ⚠️ 这条规则在 lib/urls.sh::source_scheme_for_host 里也有一份 —— bootstrap
-    #    阶段还没 source lib/，只能内联。改一处必须改另一处。
+    # ⚠️ This rule also exists in lib/urls.sh::source_scheme_for_host — the
+    #    bootstrap phase cannot source lib/ yet, so it is inlined. Changing
+    #    one means changing the other.
     case "$_host" in
         github.com|gitee.com) _scheme="https" ;;
         *)                     _scheme="ssh" ;;
@@ -231,19 +270,24 @@ if [ -z "${WARDNER_BOOTSTRAPPED:-}" ]; then
     WARDNER_SOURCE_SCHEME="$_scheme"
     export WARDNER_SOURCE_HOST WARDNER_SOURCE_SCHEME WARDNER_ORG WARDNER_REPO_NAME
 
-    # clone 地址怎么来：
+    # Where the clone URL comes from:
     #
-    # * **用户显式给了 clone 地址**（WARDNER_REPO_URL）→ **原样用** —— 里面
-    #   可能有 port、SSH 形式、内网 GitLab 的路径前缀，推测出来的地址未必等价。
-    # * **取文件地址**（含 /raw/ /blob/，或末段是文件名）→ 那不是 clone 地址，
-    #   原样用会让 git 去找用户名要密码（实测 "could not read Username for
-    #   'https://gitee.com'"，有 TTY 时更是直接卡在密码提示上）→ 按解析出的
-    #   host/org/repo 重新构造。
-    # * **用户改了 host / org / repo** → 自带的地址已经对不上了 → 重新构造。
-    # * 其余 → 原样用（入口脚本给的、已装仓的 remote 本身就是权威地址）。
+    # * **The user gave a clone URL** (WARDNER_REPO_URL) → **use it as is** —
+    #   it may carry a port, an SSH form or an intranet GitLab path prefix
+    #   that no inferred URL would be equivalent to.
+    # * **A file URL** (contains /raw/ /blob/, or ends in a file name) →
+    #   that is not a clone URL; using it as is makes git ask for a
+    #   username (observed: "could not read Username for
+    #   'https://gitee.com'", and with a TTY it hangs on the password
+    #   prompt) → rebuild it from the parsed host/org/repo.
+    # * **The user changed host / org / repo** → the shipped URL no longer
+    #   matches → rebuild it.
+    # * Otherwise → use as is (the entry script's URL and the remote of an
+    #   installed repo are authoritative addresses).
     #
-    # ⚠️ 这段判断在 lib/urls.sh::source_url_is_file_url 里也有一份 ——
-    #    bootstrap 阶段还没 source lib/，只能内联。改一处必须改另一处。
+    # ⚠️ This check also exists in lib/urls.sh::source_url_is_file_url —
+    #    the bootstrap phase cannot source lib/ yet, so it is inlined.
+    #    Changing one means changing the other.
     if [ "$_src_kind" = "user" ] && ! source_url_is_file_url "$_src"; then
         WARDNER_REPO_URL="$_src"
     elif source_url_is_file_url "$_src" || [ "$_env_override" -eq 1 ]; then
@@ -255,31 +299,36 @@ if [ -z "${WARDNER_BOOTSTRAPPED:-}" ]; then
         WARDNER_REPO_URL="$_src"
     fi
     export WARDNER_REPO_URL
-    # <<< 来源解析结束
+    # <<< source resolution ends
     _repo_dir="$WARDNER_HOME/$WARDNER_REPO_NAME"
 
     mkdir -p "$WARDNER_HOME"
 
-    # clone / pull 都可能被网络抖动打断，重试几次再判失败。
+    # Both clone and pull can be interrupted by network flapping, so retry
+    # a few times before declaring failure.
     #
-    # ⚠️ 只走 HTTPS：公网用户大多没配 GitHub SSH key，走 SSH 只会卡在
-    #    "Permission denied (publickey)" 或密码提示上。公开仓的 HTTPS
-    #    匿名 clone 才是对「没登录的人」友好的唯一路径。
+    # ⚠️ HTTPS only: most public users have no GitHub SSH key, and SSH just
+    #    hangs on "Permission denied (publickey)" or a password prompt.
+    #    Anonymous HTTPS clone of a public repo is the only path that is
+    #    friendly to people who have never logged in.
     #
-    # lowSpeedLimit/lowSpeedTime：git 默认没有连接超时，TCP 层失败要等
-    # 135s 才报（实测 "Failed to connect ... after 135137 ms"）。9 个仓
-    # 的安装里，一次抖动就能拖掉十几分钟 —— 压到 30s，配合重试总耗时可控。
+    # lowSpeedLimit/lowSpeedTime: git has no connect timeout by default, so
+    # a TCP-level failure takes 135s to surface (observed: "Failed to
+    # connect ... after 135137 ms"). Across the 9-repo install a single
+    # hiccup could cost a quarter of an hour — capping it at 30s keeps the
+    # total time bounded together with the retries.
     _try=1
     while true; do
         if [ -d "$_repo_dir/.git" ]; then
-            # 换源时把 remote 指到新源 —— `git pull` **不会**改 remote URL，
-            # 不改的话「从 Gitee 装」会继续从旧的 GitHub remote 拉，
-            # resolve_source() 也会一直显示旧的源站。
+            # When the source changes, point the remote at the new one —
+            # `git pull` **does not** rewrite the remote URL, so without
+            # this an install from Gitee keeps pulling from the old GitHub
+            # remote, and resolve_source() keeps showing the old source.
             _old_remote="$(git -C "$_repo_dir" remote get-url origin 2>/dev/null || true)"
             if [ -n "$_old_remote" ] \
                && [ "$(source_url_host "$_old_remote")" != "$WARDNER_SOURCE_HOST" ]; then
                 git -C "$_repo_dir" remote set-url origin "$WARDNER_REPO_URL" >/dev/null 2>&1 || true
-                printf '  \033[1;33m[warn]\033[0m %s 的 remote 已切到新源： %s\n' \
+                printf '  \033[1;33m[warn]\033[0m remote of %s switched to the new source: %s\n' \
                     "$WARDNER_REPO_NAME" "$WARDNER_REPO_URL" >&2
             fi
             git -C "$_repo_dir" -c "http.lowSpeedLimit=$WARDNER_GIT_LOW_SPEED_LIMIT" \
@@ -294,10 +343,10 @@ if [ -z "${WARDNER_BOOTSTRAPPED:-}" ]; then
             _what="git clone $WARDNER_REPO_NAME"
         fi
         if [ "$_try" -ge "$WARDNER_GIT_RETRY" ]; then
-            printf '\033[1;31m[fail]\033[0m %s 失败（已重试 %s 次）\n' "$_what" "$WARDNER_GIT_RETRY" >&2
+            printf '\033[1;31m[fail]\033[0m %s failed (after %s attempts)\n' "$_what" "$WARDNER_GIT_RETRY" >&2
             exit 1
         fi
-        printf '\033[1;33m[warn]\033[0m %s 失败（第 %s/%s 次），%ss 后重试\n' \
+        printf '\033[1;33m[warn]\033[0m %s failed (attempt %s/%s), retrying in %ss\n' \
             "$_what" "$_try" "$WARDNER_GIT_RETRY" "$WARDNER_RETRY_DELAY" >&2
         _try=$((_try + 1))
         sleep "$WARDNER_RETRY_DELAY"
@@ -307,20 +356,21 @@ if [ -z "${WARDNER_BOOTSTRAPPED:-}" ]; then
     exec bash "$_repo_dir/install.sh" "$@"
 fi
 
-# --- 到这里才拿得到真实路径 ---
+# --- Only now is the real path available ---
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# ⚠️ 顺序不能反：common.sh 要用 urls.sh 的 source_scheme_for_host 推导
-#    源站协议（GitHub / Gitee → https，内网 → ssh）。
+# ⚠️ The order cannot be reversed: common.sh uses urls.sh's
+#    source_scheme_for_host to derive the source scheme (GitHub / Gitee →
+#    https, intranet → ssh).
 # shellcheck source=lib/urls.sh
 . "$SCRIPT_DIR/lib/urls.sh"
 # shellcheck source=lib/common.sh
 . "$SCRIPT_DIR/lib/common.sh"
 
 # ---------------------------------------------------------------------------
-# Phase 1: 前置检查
+# Phase 1: preflight checks
 # ---------------------------------------------------------------------------
 preflight() {
-    step "前置检查"
+    step "Preflight checks"
 
     need_cmd git "apt install git"
     need_cmd "$WARDNER_PYTHON" "apt install python3"
@@ -329,29 +379,32 @@ preflight() {
     ver="$("$WARDNER_PYTHON" -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
     local major="${ver%%.*}" minor="${ver##*.}"
     if [ "$major" -lt 3 ] || { [ "$major" -eq 3 ] && [ "$minor" -lt 9 ]; }; then
-        die "需要 Python >= 3.9，当前是 $ver"
+        die "Python >= 3.9 is required, current version is $ver"
     fi
     ok "Python $ver"
 
-    # Debian/Ubuntu 的 python3-venv 是单独的包，缺了 `python3 -m venv` 会报
-    # "ensurepip is not available"。提前说清楚，别让用户对着报错猜。
+    # On Debian/Ubuntu python3-venv is a separate package; without it
+    # `python3 -m venv` fails with "ensurepip is not available". Say so
+    # up front instead of letting users guess from the error message.
     if ! "$WARDNER_PYTHON" -c 'import ensurepip, venv' >/dev/null 2>&1; then
-        die "缺 venv 模块（Debian/Ubuntu: 以 root 身份执行 apt-get install -y python3-venv）"
+        die "the venv module is missing (Debian/Ubuntu: run apt-get install -y python3-venv as root)"
     fi
-    ok "venv 模块可用"
+    ok "venv module available"
 
-    # ⚠️ 不要写 resolve_source() —— bash 会把「命令位置的 name()」当成函数
-    #    **定义**解析，后面的 } 就成了多余的 token，整个脚本语法报错。
-    #    函数调用一律不带括号。
+    # ⚠️ Do not write resolve_source() — bash parses the "name of the
+    #    command position" as a function **definition**, the trailing } then
+    #    becomes a stray token and the whole script fails to parse.
+    #    Always call functions without parentheses.
     resolve_source
 }
 
 # ---------------------------------------------------------------------------
-# 以 clone 之后的实际 remote 为准，反推组织 / 仓库名
+# Derive the org / repo name from the actual remote after the clone
 #
-# bootstrap 阶段是从「脚本的来源 URL」推断的，那是推断；clone 之后
-# remote 里写着的才是事实。两者不一致时以 remote 为准 —— 比如脚本是从
-# 某个 fork 拉的，那 fork 的 remote 就是权威的。
+# The bootstrap phase derives them from the URL the script came from — that
+# is an inference. After the clone, what is written in the remote is the
+# fact. When the two disagree the remote wins — for example when the script
+# was pulled from a fork, that fork's remote is the authoritative one.
 # ---------------------------------------------------------------------------
 resolve_source() {
     local remote host org repo scheme
@@ -362,10 +415,10 @@ resolve_source() {
     [ -n "${host:-}" ] && [ -n "${org:-}" ] && [ -n "${repo:-}" ] || return 0
 
     if [ "$org" != "$WARDNER_ORG" ]; then
-        log "源组织： $WARDNER_ORG → $org（以 clone 的 remote 为准）"
+        log "source org: $WARDNER_ORG → $org (the cloned remote wins)"
     fi
     if [ "$host" != "$WARDNER_SOURCE_HOST" ]; then
-        log "源站： $WARDNER_SOURCE_HOST → $host（以 clone 的 remote 为准）"
+        log "source host: $WARDNER_SOURCE_HOST → $host (the cloned remote wins)"
     fi
 
     scheme="$(source_scheme_for_host "$host")"
@@ -375,82 +428,88 @@ resolve_source() {
     WARDNER_REPO_NAME="$repo"
     WARDNER_REPO_DIR="$WARDNER_HOME/$WARDNER_REPO_NAME"
     WARDNER_REPO_URL="$(repo_clone_url_for "$scheme" "$host" "$org" "$repo")"
-    # 用户在环境变量里显式指定了包来源（内网镜像等）→ 不覆盖它。
-    # 覆盖了就等于把用户特意指定的源静默改掉 —— 那正是 README 里写明的用法。
+    # The user explicitly set the package source in the environment (an
+    # intranet mirror, for example) → do not override it.
+    # Overriding it silently replaces a source the user deliberately chose —
+    # which is exactly the usage the README documents.
     if [ -z "$WARDNER_PKG_BASE_ENV" ]; then
         WARDNER_PKG_BASE="$(pkg_base_for "$scheme" "$host" "$org")"
     fi
     export WARDNER_SOURCE_HOST WARDNER_SOURCE_SCHEME WARDNER_ORG WARDNER_REPO_NAME WARDNER_REPO_URL WARDNER_PKG_BASE
-    ok "源： $host/$org/$repo"
+    ok "source: $host/$org/$repo"
 
     if wardner_host_is_readonly "$host"; then
-        note "$(wardner_host_label "$host") 是只读镜像（内容由上游自动同步）—— 从它拉没问题，"
-        note "但**不要往它推**。要推送请把 remote 指回 GitHub 或内网主仓库。"
+        note "$(wardner_host_label "$host") is a read-only mirror (content is synced from upstream automatically) — pulling from it is fine,"
+        note "but **never push to it**. To push, point the remote back at GitHub or the intranet primary repo."
     fi
 }
 
 # ---------------------------------------------------------------------------
-# Phase 2: 拉宿主应用
+# Phase 2: fetch the host application
 # ---------------------------------------------------------------------------
 fetch_host() {
-    step "拉取宿主应用 $WARDNER_HOST_REPO"
+    step "Fetching the host application $WARDNER_HOST_REPO"
     fetch_repo "$WARDNER_HOST_DIR" "$WARDNER_HOST_REPO" \
-        || die "宿主应用拉取失败"
+        || die "failed to fetch the host application"
     ok "$WARDNER_HOST_REPO @ $WARDNER_HOST_DIR"
 }
 
 # ---------------------------------------------------------------------------
-# Phase 3: 建 venv
+# Phase 3: create the venv
 # ---------------------------------------------------------------------------
 create_venv() {
-    step "创建虚拟环境"
+    step "Creating the virtual environment"
     if [ -x "$WARDNER_VENV/bin/python" ]; then
-        ok "复用已有 venv（$WARDNER_VENV）"
+        ok "reusing the existing venv ($WARDNER_VENV)"
     else
         mkdir -p "$(dirname "$WARDNER_VENV")"
         "$WARDNER_PYTHON" -m venv "$WARDNER_VENV" \
-            || die "创建 venv 失败（Debian/Ubuntu: 以 root 身份执行 apt-get install -y python3-venv）"
-        ok "已创建 $WARDNER_VENV"
+            || die "failed to create the venv (Debian/Ubuntu: run apt-get install -y python3-venv as root)"
+        ok "created $WARDNER_VENV"
     fi
     "$WARDNER_VENV/bin/python" -m pip install --quiet --upgrade pip setuptools wheel
-    ok "pip 就绪（$("$WARDNER_VENV/bin/python" -m pip --version | cut -d' ' -f1-2)）"
+    ok "pip ready ($("$WARDNER_VENV/bin/python" -m pip --version | cut -d' ' -f1-2))"
 }
 
 # ---------------------------------------------------------------------------
-# Phase 4: 拉 SDK / 插件包
+# Phase 4: fetch the SDK / plugin packages
 #
-# 必须**先 clone 到 .venv/src/ 再让 pip 装**：
-# update_rkwhl.sh 的 "目录不存在" 分支走的是 `pip install -e <git+url>`，
-# 而 pip 对 VCS 的 editable 安装是把仓库 clone 到临时目录再指向它 —— 临时
-# 目录装完就被删，editable 安装当场就废（import 报 ModuleNotFoundError），
-# 而 pip 全程报成功。
+# It **must clone into .venv/src/ before pip installs**:
+# the "directory does not exist" branch of update_rkwhl.sh runs
+# `pip install -e <git+url>`, and pip installs a VCS editable package by
+# cloning the repo into a temporary directory and pointing at it — that
+# temporary directory is deleted once the install finishes, so the editable
+# install is dead on arrival (import raises ModuleNotFoundError) while pip
+# reports success the whole time.
 # ---------------------------------------------------------------------------
 fetch_packages() {
-    step "拉取 SDK / 卡片插件包"
+    step "Fetching the SDK / card plugin packages"
     mkdir -p "$WARDNER_VENV_SRC"
     local pkg repo n=0
     while read -r pkg repo; do
         [ -z "${pkg:-}" ] && continue
-        fetch_repo "$WARDNER_VENV_SRC/$pkg" "$repo" || warn "$pkg 拉取失败，跳过"
+        fetch_repo "$WARDNER_VENV_SRC/$pkg" "$repo" || warn "failed to fetch $pkg, skipping"
         n=$((n + 1))
     done <<EOF
 $(read_packages)
 EOF
-    ok "共 $n 个包 → $WARDNER_VENV_SRC"
+    ok "$n packages → $WARDNER_VENV_SRC"
 }
 
 # ---------------------------------------------------------------------------
-# Phase 5: 编译依赖
+# Phase 5: build dependencies
 #
-# wdndds 的 .so 是**装的时候现场编**的（_build.py 的 build_py 钩子），
-# 需要 cmake / g++ / patchelf / foonathan 开发头文件。
+# The .so of wdndds is **compiled at install time** (the build_py hook of
+# _build.py), which needs cmake / g++ / patchelf / the foonathan development
+# headers.
 #
-# FastDDS 3.6 的官方预编译产物是**随 wdndds 仓一起分发**的
-# （native/lib/ 下），不需要联网编译 —— 这点很关键，板子常常没外网。
-# native/bin/nodesize_dbg 桩也在仓里，不需要额外生成。
+# The official prebuilt binaries of FastDDS 3.6 are **shipped with the
+# wdndds repo** (under native/lib/), so no networked build is needed — that
+# matters because boards often have no internet access. The native/bin/
+# nodesize_dbg stub is in the repo as well and needs no extra generation.
 # ---------------------------------------------------------------------------
 ensure_build_deps() {
-    step "检查编译依赖（wdndds 的 .so 要现场编）"
+    step "Checking the build dependencies (the .so of wdndds is compiled on the spot)"
 
     local need=()
     local p
@@ -459,92 +518,106 @@ ensure_build_deps() {
     done
 
     if [ ${#need[@]} -eq 0 ]; then
-        ok "编译依赖齐全"
+        ok "all build dependencies present"
         return 0
     fi
 
     if [ "$(id -u)" -eq 0 ]; then
-        log "安装 apt 依赖： ${need[*]}"
+        log "installing the apt dependencies: ${need[*]}"
         apt-get update -qq >/dev/null 2>&1 || true
         apt-get install -y "${need[@]}" >/dev/null 2>&1 \
-            || warn "apt 安装失败，继续往下走"
-        ok "编译依赖处理完毕"
+            || warn "the apt install failed, continuing anyway"
+        ok "build dependencies handled"
         return 0
     fi
 
-    # 非 root：脚本**不自行提权** —— 只把要执行的命令原样打出来，由操作员
-    # 自己在 root 身份下跑。缺这几个包只影响 wdndds 的 .so，其余链路不依赖
-    # 它，所以不致命。
-    warn "缺编译依赖： ${need[*]}"
-    warn "wdndds 的 .so 可能编不出来（算力页会报「功能未启用」）。"
-    warn "请以 root 身份执行下面三条，然后重跑本脚本补编："
+    # Not root: the script **never elevates privileges** — it only prints the
+    # commands to run, and the operator runs them as root. These packages
+    # only affect the .so of wdndds; the rest of the chain does not depend on
+    # it, so it is not fatal.
+    warn "missing build dependencies: ${need[*]}"
+    warn "the .so of wdndds may fail to build (the compute page will report \"feature not enabled\")."
+    warn "run the three commands below as root, then re-run this script to build the rest:"
     warn "  apt-get update"
     warn "  apt-get install -y ${need[*]}"
     warn "  bash $WARDNER_HOST_DIR/update_rkwhl.sh"
-    return 0   # 不致命：其它链路不依赖它
+    return 0   # not fatal: the other chains do not depend on it
 }
 
 # ---------------------------------------------------------------------------
-# Phase 6: 装包 + 校验
+# Phase 6: install the packages + verify
 #
-# 真正的安装交给 wdnwebui 仓里的 update_rkwhl.sh：
-#   * 装 requirements.txt（web 侧依赖）
-#   * 修补 v4l2 的 py3 兼容问题
-#   * 逐包 git pull + editable 重装（HEAD 没变就跳过）
-#   * 断言 wdndds / wdnav 的 .so 真的落地了（setuptools 会静默吞 hook 失败）
-#   * 校验 4 个插件包的卡片真的注册上了（entry point → manifest id → static/）
-#   * 审计各 SDK 声明的依赖（--no-deps 装法的对冲）
+# The real installation is delegated to update_rkwhl.sh in the wdnwebui repo:
+#   * installs requirements.txt (the web side dependencies)
+#   * patches the py3 compatibility issue of v4l2
+#   * per package: git pull + editable reinstall (skipped when HEAD is
+#     unchanged)
+#   * asserts that the .so of wdndds / wdnav really landed (setuptools
+#     silently swallows hook failures)
+#   * verifies that the cards of the 4 plugin packages really registered
+#     (entry point → manifest id → static/)
+#   * audits the dependencies declared by each SDK (the hedge against the
+#     --no-deps install method)
 #
-# 首次安装必须 FORCE_REBUILD：刚 clone 出来的包，pull 前后 HEAD 一致，
-# update_rkwhl.sh 会判定「HEAD 未变」而跳过安装 —— 结果就是啥都没装。
+# The first install must FORCE_REBUILD: for a freshly cloned package the
+# HEAD is identical before and after the pull, so update_rkwhl.sh decides
+# "HEAD unchanged" and skips the install — the result is that nothing is
+# installed.
 # ---------------------------------------------------------------------------
 install_packages() {
-    step "安装与校验"
+    step "Installing and verifying"
 
     local script="$WARDNER_HOST_DIR/update_rkwhl.sh"
-    [ -f "$script" ] || die "找不到 $script（宿主仓拉取不完整？）"
+    [ -f "$script" ] || die "not found: $script (was the host repo fetched completely?)"
 
     local force=""
     if ! "$WARDNER_VENV/bin/python" -c "import wdnav, wdnai, wdndds, wdnhid" >/dev/null 2>&1; then
         force=1
-        note "首次安装 —— 强制重建全部包"
+        note "first install — forcing a rebuild of all packages"
     fi
 
-    # WARDNER_PKG_BASE：让 update_rkwhl.sh 的「目录不存在」兜底路径也走**源站**
-    # （GitHub 或 Gitee），而不是默认的内网镜像。
+    # WARDNER_PKG_BASE: makes the "directory does not exist" fallback of
+    # update_rkwhl.sh use the **source site** (GitHub or Gitee) as well,
+    # instead of the default intranet mirror.
     if ! (
         cd "$WARDNER_HOST_DIR" || exit 1
         WARDNER_PKG_BASE="$WARDNER_PKG_BASE" \
         UPDATE_RKWHL_FORCE_REBUILD="$force" \
         bash "$script"
     ); then
-        # update_rkwhl.sh 逐包驱动：某个包失败只记 warn 并继续，最后统一
-        # 汇总「以下包未更新」并 exit 1。首次安装时这意味着**有包没装上**。
+        # update_rkwhl.sh drives package by package: a failing package only
+        # logs a warning and the run continues, then it summarises "the
+        # following packages were not updated" and exits 1. On a first
+        # install that means **some packages were not installed**.
         echo "" >&2
-        die "安装未完成 —— 见上方「以下包未更新」的汇总。
-     首次安装失败最常见的是网络：clone / pip 拉 $WARDNER_SOURCE_HOST 抖了一下。
-     直接重跑本脚本即可（已装好的包会跳过）："
+        die "the install did not complete — see the \"the following packages were not updated\" summary above.
+     The most common cause on a first install is the network: the clone / pip
+     pull from $WARDNER_SOURCE_HOST hiccuped. Just re-run this script (the
+     packages that are already installed are skipped):"
     fi
 
-    ok "全部包安装完成"
+    ok "all packages installed"
 }
 
 # ---------------------------------------------------------------------------
-# Phase 7: 冒烟验证 + 交付信息
+# Phase 7: smoke test + handover information
 # ---------------------------------------------------------------------------
 verify() {
-    step "冒烟验证"
+    step "Smoke test"
 
-    # 硬断言：4 个 SDK 必须真的 import 得起来。
+    # Hard assertion: the 4 SDKs must really be importable.
     #
-    # ⚠️ 这里必须硬失败，不能只 warn —— update_rkwhl.sh 的 verify_outputs 对
-    #    wdnai / wdnhid 直接 `return 0`（纯 Python，没有 .so 可断言），而
-    #    audit_sdk_deps 只查「SDK 声明的依赖能不能用」，不查包自身能不能
-    #    import。于是 .pth / editable 装歪了这类故障会**穿过所有门禁**，
-    #    最后还打印一句「安装完成」—— 而 wdnai 是所有 LLM/VLM 能力的底座。
+    # ⚠️ This has to fail hard, not just warn — verify_outputs of
+    #    update_rkwhl.sh `return 0` for wdnai / wdnhid (pure Python, no .so
+    #    to assert), and audit_sdk_deps only checks "can the SDK-declared
+    #    dependencies be used", not whether the package itself can be
+    #    imported. So a broken .pth / editable install slips **through every
+    #    gate**, and the script still prints "installation complete" — and
+    #    wdnai is the base of every LLM/VLM capability.
     #
-    #    wdndds / wdnav 另有 .so 落地断言兜着，4 个插件包另有卡片注册校验
-    #    兜着（find_spec 失败即 BAD）。wdnai / wdnhid 缺的正是这一道。
+    #    wdndds / wdnav have .so landing assertions, the 4 plugin packages
+    #    have card registration checks (a failing find_spec is BAD).
+    #    wdnai / wdnhid are exactly the ones missing that check.
     if ! "$WARDNER_VENV/bin/python" - <<'PY'
 import importlib, sys
 mods = ["wdnav", "wdnai", "wdndds", "wdnhid"]
@@ -559,51 +632,56 @@ for m in mods:
 sys.exit(1 if bad else 0)
 PY
     then
-        die "SDK import 检查未通过 —— 上面失败的包没装好。
-     常见原因：editable 安装的 .pth 指向了不存在的路径，或某个包的
-     clone/pull 中途失败只装了一半。
-     修复：删掉对应包目录后重跑本脚本（会重新 clone）：
-       rm -rf $WARDNER_VENV_SRC/<包名>"
+        die "the SDK import check failed — the packages listed above are not installed properly.
+     Common causes: the .pth of an editable install points at a path that
+     does not exist, or the clone/pull of a package failed halfway.
+     Fix: delete the directory of the affected package and re-run this script
+     (it clones it again):
+       rm -rf $WARDNER_VENV_SRC/<package-name>"
     fi
 
     local so="$WARDNER_VENV_SRC/wdndds/src/wdndds/dds/_native/libwdndds_cshim.so"
     if [ -f "$so" ]; then
-        ok "libwdndds_cshim.so 已就位"
+        ok "libwdndds_cshim.so is in place"
     else
-        warn "libwdndds_cshim.so 缺失 —— 算力（本地模型）功能不可用"
-        warn "  补编： bash $WARDNER_HOST_DIR/update_rkwhl.sh"
+        warn "libwdndds_cshim.so is missing — the compute (local model) feature is unavailable"
+        warn "  rebuild: bash $WARDNER_HOST_DIR/update_rkwhl.sh"
     fi
 
     local shim="$WARDNER_VENV_SRC/wdnav/src/wdnav/lib/libshim_video.so"
     if [ -f "$shim" ]; then
-        ok "libshim_video.so 已就位"
+        ok "libshim_video.so is in place"
     else
-        warn "libshim_video.so 缺失 —— 视频编解码不可用"
+        warn "libshim_video.so is missing — video encoding/decoding is unavailable"
     fi
 }
 
 # ---------------------------------------------------------------------------
-# Phase 8: 装 wdn 命令
+# Phase 8: install the wdn command
 #
-# wdn = wardner 命令行入口：bin/wdn（bash 启动器）→ 用 .venv 的 python 跑
-# cli/wdn.py。第一个子命令是 `wdn update` —— 把所有已下载的仓更新到 GitHub
-# 最新并重新同步 venv。
+# wdn = the wardner command line entry point: bin/wdn (a bash launcher) →
+# runs cli/wdn.py with the python of the .venv. The first subcommand is
+# `wdn update` — it updates every downloaded repo to the latest GitHub
+# revision and re-syncs the venv.
 #
-# 装两处：
-#   * $WARDNER_HOME/<repo>/bin/wdn   真身；PATH 由 ~/.bashrc 的托管块给出
-#   * ~/.local/bin/wdn               symlink，给不读 bashrc 的场景兜底
-#     （debian 默认 ~/.profile 会把 ~/.local/bin 加进 PATH）
+# Installed in two places:
+#   * $WARDNER_HOME/<repo>/bin/wdn   the real one; the PATH comes from the
+#     managed block in ~/.bashrc
+#   * ~/.local/bin/wdn               symlink, a fallback for the cases that
+#     do not read bashrc (on Debian ~/.profile adds ~/.local/bin to the
+#     PATH by default)
 #
-# 再把 WARDNER_HOME + PATH 写进 ~/.bashrc 的**托管块**（带起止标记），
-# 重复安装是替换旧块而不是追加两份。
+# Then WARDNER_HOME + PATH are written into the **managed block** of
+# ~/.bashrc (with begin/end markers), so a repeated install replaces the old
+# block instead of appending a second copy.
 # ---------------------------------------------------------------------------
 install_wdn_command() {
-    step "安装 wdn 命令"
+    step "Installing the wdn command"
 
     local bindir="$WARDNER_REPO_DIR/bin"
     local cmd="$bindir/wdn"
     if [ ! -f "$cmd" ]; then
-        warn "找不到 $cmd —— 跳过 wdn 安装"
+        warn "not found: $cmd — skipping the wdn installation"
         return 0
     fi
     chmod +x "$cmd" 2>/dev/null || true
@@ -611,64 +689,65 @@ install_wdn_command() {
     local target_home
     target_home="$(wardner_target_home)"
 
-    # ~/.local/bin 的软链
+    # The symlink in ~/.local/bin
     local local_bin="$target_home/.local/bin"
     if mkdir -p "$local_bin" 2>/dev/null; then
         if ln -sf "$cmd" "$local_bin/wdn" 2>/dev/null; then
-            ok "软链： $local_bin/wdn → $cmd"
+            ok "symlink: $local_bin/wdn → $cmd"
         else
-            warn "建软链失败（不影响使用，bashrc 里已加 PATH）"
+            warn "could not create the symlink (does not affect usage, the PATH is already set in bashrc)"
         fi
     else
-        warn "建不了 $local_bin（不影响使用，bashrc 里已加 PATH）"
+        warn "could not create $local_bin (does not affect usage, the PATH is already set in bashrc)"
     fi
 
-    # ~/.bashrc 托管块
+    # The managed block in ~/.bashrc
     local rc="$target_home/.bashrc"
     if wardner_write_bashrc "$rc" "$WARDNER_HOME" "$bindir"; then
-        ok "已写入 $rc"
+        ok "written to $rc"
     else
-        warn "写 $rc 失败 —— 手工加这一行也能用："
+        warn "could not write $rc — adding this line by hand works too:"
         warn "  export PATH=\"$bindir:\$PATH\""
     fi
 }
 
 report() {
     local src_label; src_label="$(wardner_host_label "$WARDNER_SOURCE_HOST")"
-    local src_line="  源站         $WARDNER_SOURCE_HOST（$src_label）"
+    local src_line="  Source host    $WARDNER_SOURCE_HOST ($src_label)"
 
     if wardner_host_is_readonly "$WARDNER_SOURCE_HOST"; then
         src_line="$src_line
-  ※ 只读镜像 —— 内容由上游自动同步，**不要往它推代码**；推送请用 GitHub / 内网主仓库"
+  Note: read-only mirror — the content is synced from upstream automatically, **do not push code to it**;
+        push to GitHub / the intranet primary repo instead"
     fi
 
     cat >&2 <<EOF
 
-$(printf '%s' "$C_GRN")安装完成。$(printf '%s' "$C_RST")
+$(printf '%s' "$C_GRN")Installation complete.$(printf '%s' "$C_RST")
 
-  安装根目录   $WARDNER_HOME
+  Install root   $WARDNER_HOME
 $src_line
-  宿主应用     $WARDNER_HOST_DIR
-  虚拟环境     $WARDNER_VENV
-  SDK / 插件   $WARDNER_VENV_SRC
+  Host app       $WARDNER_HOST_DIR
+  Virtual env    $WARDNER_VENV
+  SDK / plugins  $WARDNER_VENV_SRC
 
-启动服务：
+Start the service:
 
   cd $WARDNER_HOST_DIR
-  .venv/bin/python run.py          # 打开 http://<板子IP>:8000/
+  .venv/bin/python run.py          # opens http://<board-ip>:8000/
 
-wdn 命令（已装进 PATH）：
+The wdn command (already on the PATH):
 
-  wdn update                       # 把所有仓更新到 $src_label 最新并重新同步 venv
-  wdn status                       # 看各仓的 commit / remote 和 venv 状态
+  wdn update                       # update every repo to the latest on $src_label and re-sync the venv
+  wdn status                       # show each repo's commit / remote and the state of the venv
 
-  ※ 当前终端还没生效 —— 新开一个终端，或执行： source ~/.bashrc
+  Note: not active in this terminal yet — open a new terminal, or run: source ~/.bashrc
 
-更新（拉最新 + 重装）：
+To update (pull the latest + reinstall):
 
   $WARDNER_REPO_DIR/install.sh
-  # 或： $WARDNER_REPO_DIR/update.sh
-  # 或： wdn update
+  # or: $WARDNER_REPO_DIR/update.sh
+  # or: wdn update
 
 EOF
 }

@@ -181,9 +181,9 @@ cmake / build-essential / patchelf / foonathan 头文件）时，它只把要执
 命令原样打出来，由你自己以 root 身份跑：
 
 ```
-× 缺编译依赖： cmake build-essential patchelf libfoonathan-memory-dev
-× wdndds 的 .so 可能编不出来（算力页会报「功能未启用」）。
-× 请以 root 身份执行下面三条，然后重跑本脚本补编：
+× missing build dependencies: cmake build-essential patchelf libfoonathan-memory-dev
+× the .so of wdndds may fail to build (the compute page will report "feature not enabled").
+× run the three commands below as root, then re-run this script to build the rest:
 ×   apt-get update
 ×   apt-get install -y cmake build-essential patchelf libfoonathan-memory-dev
 ×   bash ~/.wardner/wdnwebui/update_rkwhl.sh
@@ -305,7 +305,7 @@ cd ~/.wardner/wdnwebui
 .venv/bin/python scripts/check_sdk_deps.py    # 全量依赖审计
 ```
 
-**源站不对（明明从 Gitee 装的，前置检查里却显示 `源： github.com/…`）。**
+**源站不对（明明从 Gitee 装的，前置检查里却显示 `source: github.com/…`）。**
 先确认用的是**入口脚本**：`install_gitee.sh` 才是 Gitee 源；
 `install.sh` 是内部实现，**不含**源站声明（它只能靠运行时探测，探测不到就回落
 GitHub 并打告警）：

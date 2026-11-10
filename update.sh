@@ -1,22 +1,26 @@
 #!/usr/bin/env bash
-# wdnwebui 更新脚本 —— 拉最新代码 + 重装。
+# wdnwebui update script — pull the latest code + reinstall.
 #
 #   ~/.wardner/wardner/update.sh
 #
-# 与 install.sh 的区别：install.sh 是「从零装」的心智模型，update.sh 是
-# 「我已经在用了，给我新的」。实际上两者走同一条路径（install.sh 本身幂等，
-# 会 pull 每个仓、只重装 HEAD 变了的包），update.sh 只是把语义说清楚，
-# 免得用户记不住装到哪了。
+# The difference to install.sh: install.sh follows the "install from
+# scratch" mental model, update.sh follows "I am already using it, give me
+# the new one". In practice both take the same path (install.sh itself is
+# idempotent: it pulls every repo and only reinstalls the packages whose
+# HEAD changed), update.sh just makes the intent clear, so nobody has to
+# remember where things were installed.
 #
-# 真正干活的是宿主仓里的 update_rkwhl.sh —— 470 行在板子上打磨过的更新逻辑
-# （.so 落地断言 / editable 残留清理 / 卡片注册校验 / SDK 依赖审计）都在那。
+# The real work happens in update_rkwhl.sh of the host repo — 470 lines of
+# update logic refined on real boards (.so landing assertions / editable
+# install leftovers / card registration checks / SDK dependency audits) live
+# there.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 if [ ! -f "$SCRIPT_DIR/install.sh" ]; then
-    echo "[fail] $SCRIPT_DIR/install.sh 不存在 —— 这不像是个正常的安装目录" >&2
+    echo "[fail] $SCRIPT_DIR/install.sh does not exist — this does not look like a normal install directory" >&2
     exit 1
 fi
 
