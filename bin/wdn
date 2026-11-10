@@ -3,8 +3,9 @@
 #
 #   wdn update     update every downloaded repo to the latest GitHub
 #                  revision and re-sync the venv
-#   wdn status     show the local commit / remote of every repo and the
-#                  state of the venv
+#   wdn status     show the local commit / remote of every repo, the state
+#                  of the venv and the wdnai model catalog (which models are
+#                  installed on this board)
 #   wdn doctor     check the system environment: the native .so files, the
 #                  system libraries of the hardware engines (MPP / RGA /
 #                  Mali / RKNN), the SDK versions, the dependency

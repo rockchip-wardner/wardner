@@ -157,7 +157,7 @@ use it directly:
 
 ```bash
 wdn update      # update every downloaded repo to the latest on the source site, and re-sync the venv
-wdn status      # show each repo's commit / remote and the venv status
+wdn status      # show each repo's commit / remote, the venv state and the models
 wdn start 8080  # start the wdnwebui service in the background, listening on port 8080
 wdn stop        # stop the wdnwebui service
 wdn version     # version number
@@ -196,6 +196,36 @@ instead of fighting the service manager behind its back.
 
 The `compute_worker` processes are spawned with their own session on purpose — they
 survive the stop and are adopted again by the next boot (over DDS).
+
+### `wdn status` — what is actually on the board
+
+`wdn status` prints four blocks: the commit / remote of every repo, the venv, the SDK
+imports and — because the model weights are the last thing that can be missing while
+everything else looks healthy — the **models**:
+
+```
+▶ Models
+  root  /mnt/oem/models  (wdnwebui config base.model_path)
+  ● qwen3-vl-4b            Qwen3-VL-4B            ok          qwen3-vl-4b
+  ● qwen3.5-vl-4b         Qwen3.5-4B             ok          qwen3.5-vl-4b
+  ● qwen3-tts              Qwen3-TTS              ok          qwen3-tts
+  × qwen3-asr              Qwen3-ASR              missing     -
+  expected in /mnt/oem/models/Qwen3-ASR
+  ...
+  7 of 11 legal models are installed and complete
+```
+
+The catalog is **not** hard-coded in the CLI: the probe (`cli/model_probe.py`) asks the
+installed `wdnai` for it — the `SystemLanguageModel` factories that bind to a fixed
+model directory — and calls each factory, so both the paths and the "files missing"
+verdict come from the SDK itself. The root is resolved the way the service resolves it:
+`WDNAI_MODELS_DIR` first (the service writes `base.model_path` into it at boot), then
+the `base.model_path` of the host config, then the SDK default `/userdata/models`.
+
+The last column is the id of the worker manifest found in the model folder — that is the
+id the compute page serves the model under. A manifest whose `spec_factory` is unknown
+to the installed `wdnai` is reported as broken, and a folder in the model root that no
+model claims is listed at the end.
 
 ### `wdn update` does three things
 

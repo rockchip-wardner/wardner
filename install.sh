@@ -748,7 +748,7 @@ Start the service:
 The wdn command (already on the PATH):
 
   wdn update                       # update every repo to the latest on $src_label and re-sync the venv
-  wdn status                       # show each repo's commit / remote and the state of the venv
+  wdn status                       # show each repo's commit / remote, the venv and the models
 
   Note: not active in this terminal yet — open a new terminal, or run: $(wardner_source_hint)
 

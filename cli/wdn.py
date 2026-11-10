@@ -6,7 +6,8 @@ Subcommands
   update    update every downloaded repo to the latest revision of the
             **source site** (GitHub / the Gitee mirror) and re-sync the venv
   status    list the local commit, the remote and the readiness of the venv
-            for every repo
+            for every repo, plus the wdnai model catalog and the model
+            files that are on the board
   doctor    check the system environment: the native .so files, the **system
             libraries of the hardware engines** (MPP / RGA / Mali / RKNN),
             the SDK versions, the dependency versions, the plugin registration
@@ -792,7 +793,223 @@ def cmd_status(args: argparse.Namespace) -> int:
 
     step("SDK")
     _smoke()
+
+    step("Models")
+    _models_section()
     return 0
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: status — the models
+#
+# The model files are the last thing that can be missing while everything
+# else looks healthy: the repos are up to date, the venv is fine, the SDKs
+# import — and then a worker fails to load because the weights are not on
+# the board. So `wdn status` asks the **installed wdnai** where it expects
+# its files and compares that with the disk.
+# ---------------------------------------------------------------------------
+
+#: The SDK's own default models root (``wdnai.model._models_root``).
+WDNAI_DEFAULT_MODELS_DIR = "/userdata/models"
+
+#: The models-root candidates in priority order — the same list the host app
+#: uses (``app.core.config._MODEL_ROOT_CANDIDATES`` + the home fallback).
+#: The first one that exists wins.
+WDNAI_MODELS_ROOT_CANDIDATES = (WDNAI_DEFAULT_MODELS_DIR, "/mnt/oem/models")
+
+
+def _read_jsonc(path: Path) -> dict:
+    """Parse a JSONC file — JSON plus ``//`` / ``/* */`` comments and trailing commas.
+
+    The host app's config is JSONC. The CLI cannot import the app (the app
+    is one of the things being checked), so the tolerant reader lives here.
+    It is deliberately small: strip the comments, drop the trailing commas,
+    hand the rest to :mod:`json`.
+    """
+    text = path.read_text(encoding="utf-8")
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    in_string = False
+    while i < n:
+        ch = text[i]
+        if in_string:
+            out.append(ch)
+            if ch == "\\" and i + 1 < n:
+                out.append(text[i + 1])
+                i += 2
+                continue
+            if ch == '"':
+                in_string = False
+            i += 1
+            continue
+        if ch == '"':
+            in_string = True
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "/" and i + 1 < n and text[i + 1] == "/":
+            while i < n and text[i] != "\n":
+                i += 1
+            continue
+        if ch == "/" and i + 1 < n and text[i + 1] == "*":
+            i += 2
+            while i + 1 < n and not (text[i] == "*" and text[i + 1] == "/"):
+                i += 1
+            i += 2
+            continue
+        out.append(ch)
+        i += 1
+    body = re.sub(r",(\s*[}\]])", r"\1", "".join(out))
+    data = json.loads(body)
+    return data if isinstance(data, dict) else {}
+
+
+def _models_root() -> tuple[Path, str]:
+    """Resolve the models root and say where the value came from.
+
+    The order mirrors the service: the service writes ``base.model_path``
+    into ``WDNAI_MODELS_DIR`` at boot, so the environment wins; the config
+    file is the persistent source of truth; the SDK default is the
+    fallback.
+    """
+    env = os.environ.get("WDNAI_MODELS_DIR", "").strip()
+    if env:
+        return Path(env), "env WDNAI_MODELS_DIR"
+
+    config = host_repo() / "config.jsonc"
+    try:
+        data = _read_jsonc(config)
+    except (OSError, ValueError):
+        data = {}
+    value = ((data.get("base") or {}).get("model_path") or "").strip()
+    if value:
+        return Path(value), "wdnwebui config base.model_path"
+
+    # No config value — fall back to the same priority the host app uses
+    # when it seeds the config: the first candidate that exists, else the
+    # operator's home.
+    for candidate in WDNAI_MODELS_ROOT_CANDIDATES:
+        path = Path(candidate)
+        if path.is_dir():
+            return path, "wdnai default"
+    return Path.home() / "models", "wdnai default"
+
+
+def _probe_models(root: Path) -> dict | None:
+    """Ask the installed wdnai where its model files are.
+
+    The CLI never imports the SDK itself — the SDKs are the thing being
+    checked, and importing them in-process would hide a broken install
+    behind a successful import. The probe (``cli/model_probe.py``) runs with
+    the venv python and reports the legal catalog (the
+    ``SystemLanguageModel`` factories that bind to a fixed model directory),
+    the directory each one resolves to and whether the files are there.
+    """
+    probe = Path(__file__).resolve().parent / "model_probe.py"
+    if not probe.is_file():
+        return None
+    env = {**os.environ, "WDNAI_MODELS_DIR": str(root)}
+    try:
+        r = subprocess.run(
+            [sys.executable, str(probe), "--json"],
+            capture_output=True, text=True, env=env,
+            stdin=subprocess.DEVNULL, timeout=180,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode != 0:
+        return None
+    try:
+        report = json.loads(r.stdout)
+    except ValueError:
+        return None
+    return report if isinstance(report, dict) else None
+
+
+def _model_state(model: dict) -> str:
+    """``ok`` / ``incomplete`` / ``missing`` / ``no sdk`` for one catalog entry."""
+    if not model.get("known"):
+        return "no sdk"
+    if not model.get("exists"):
+        return "missing"
+    if model.get("complete") is False:
+        return "incomplete"
+    return "ok"
+
+
+def _models_section() -> None:
+    """Print the wdnai model paths: the legal catalog and what is on disk."""
+    root, source = _models_root()
+    print(f"  {C_DIM}root{C_RST}  {root}  {C_DIM}({source}){C_RST}")
+
+    report = _probe_models(root)
+    if not report:
+        bad("the model probe failed — the legal model catalog is unknown")
+        note("run it by hand: python cli/model_probe.py --json")
+        return
+
+    models = report.get("models") or []
+    installed = report.get("installed") or []
+
+    # The manifest id per model directory — that is the id the webui serves
+    # the model under (the manifest lives inside the model folder).
+    manifest_by_dir: dict[str, list[dict]] = {}
+    for manifest in installed:
+        manifest_by_dir.setdefault(str(manifest.get("dir", "")), []).append(manifest)
+
+    width_id = max([len(str(m.get("id", ""))) for m in models] + [6])
+    width_dir = max([len(str(m.get("dir_name", ""))) for m in models] + [6])
+
+    ready = 0
+    for model in models:
+        mid = str(model.get("id", ""))
+        dname = str(model.get("dir_name", ""))
+        state = _model_state(model)
+        if state == "ok":
+            ready += 1
+            mark = f"{C_GRN}●{C_RST}"
+        elif state == "incomplete":
+            mark = f"{C_YEL}×{C_RST}"
+        else:
+            mark = f"{C_RED}×{C_RST}"
+
+        manifests = manifest_by_dir.get(dname, [])
+        mcol = ", ".join(str(m.get("id", "")) for m in manifests) or "-"
+        print(f"  {mark} {mid:<{width_id}}  {dname:<{width_dir}}  {state:<10}  {C_DIM}{mcol}{C_RST}")
+
+        if state == "incomplete":
+            missing = [str(x) for x in (model.get("missing") or [])]
+            if missing:
+                shown = ", ".join(missing[:4])
+                more = f" … (+{len(missing) - 4})" if len(missing) > 4 else ""
+                note(f"missing: {shown}{more}")
+        elif state == "missing":
+            hint = ""
+            if os.environ.get(str(model.get("env", "")), "").strip():
+                hint = "  (overridden by the environment)"
+            note(f"expected in {model.get('dir', '')}{hint}")
+        elif state == "ok":
+            # The SDK may resolve the model somewhere else than the default
+            # (an env override, or the Qwen-Image-2.1 board fallback) — say
+            # so, the folder name alone would be misleading.
+            default = root / str(model.get("dir_name", ""))
+            if str(model.get("dir", "")) != str(default):
+                note(f"resolved: {model.get('dir', '')}")
+        elif state == "no sdk" and model.get("error"):
+            note(str(model.get("error")))
+
+    print(f"  {C_DIM}{ready} of {len(models)} legal models are installed and complete{C_RST}")
+
+    unknown = [str(d) for d in (report.get("unknown_dirs") or [])]
+    if unknown:
+        note("folders in the model root that no wdnai model claims: " + ", ".join(unknown))
+
+    for manifest in installed:
+        if not manifest.get("known_factory"):
+            bad(f"the manifest {manifest.get('id')} points at an unknown "
+                f"spec_factory {manifest.get('spec_factory')!r} — the installed "
+                f"wdnai cannot build it")
 
 
 # ---------------------------------------------------------------------------

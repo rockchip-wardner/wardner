@@ -143,7 +143,7 @@ wdn update                     # 推荐：更新所有仓 + 重新同步 venv
 
 ```bash
 wdn update      # 把所有已下载的仓更新到源站最新，并重新同步 venv
-wdn status      # 看各仓的 commit / remote 和 venv 状态
+wdn status      # 看各仓的 commit / remote、venv 状态和模型
 wdn start 8080  # 后台启动 wdnwebui 服务，监听 8080 端口
 wdn stop        # 停掉 wdnwebui 服务
 wdn version     # 版本号
@@ -180,6 +180,33 @@ uvicorn 的 reloader 和它派生的 worker 一起下去。`wdn stop` 会一直�
 
 `compute_worker` 是**故意**用独立 session 起的 —— 它们停服务后还活着，下次启动会被
 DDS 重新接管。
+
+### `wdn status` —— 板子上到底有什么
+
+`wdn status` 打四段：各仓的 commit / remote、venv、SDK 的导入，以及**模型** ——
+因为模型权重是「别的都正常、就是跑不起来」时最后才可能缺的那一环：
+
+```
+▶ Models
+  root  /mnt/oem/models  (wdnwebui config base.model_path)
+  ● qwen3-vl-4b            Qwen3-VL-4B            ok          qwen3-vl-4b
+  ● qwen3.5-vl-4b         Qwen3.5-4B             ok          qwen3.5-vl-4b
+  ● qwen3-tts              Qwen3-TTS              ok          qwen3-tts
+  × qwen3-asr              Qwen3-ASR              missing     -
+  expected in /mnt/oem/models/Qwen3-ASR
+  ...
+  7 of 11 legal models are installed and complete
+```
+
+这个清单**没有写死在 CLI 里**：探针（`cli/model_probe.py`）向装好的 `wdnai` 要清单
+—— 也就是那些绑定到固定模型目录的 `SystemLanguageModel` 工厂 —— 并逐个调用，
+所以路径和「缺哪些文件」的结论都出自 SDK 自己。模型根的解析顺序跟服务一致：
+先 `WDNAI_MODELS_DIR`（服务启动时把 `base.model_path` 写进去），再宿主配置的
+`base.model_path`，最后是 SDK 默认的 `/userdata/models`。
+
+最后一列是模型目录里 worker manifest 的 id —— 算力页就是按这个 id 提供该模型的。
+manifest 里的 `spec_factory` 如果装好的 `wdnai` 不认识，会被报成坏的；模型根里
+没有任何模型认领的目录会列在最后。
 
 ### `wdn update` 做三件事
 
