@@ -11,25 +11,38 @@ plugins.
 
 | Source | One-click command | When to use it |
 |---|---|---|
-| **GitHub** | `curl -fsSL https://github.com/rockchip-wardner/wardner/raw/master/install.sh \| bash` | Default; international networks |
-| **Gitee domestic mirror** | `curl -fsSL https://gitee.com/rockchip-wardner/wardner/raw/master/install.sh \| bash` | Faster on domestic networks |
+| **GitHub** | `curl -fsSL https://github.com/rockchip-wardner/wardner/raw/master/install_github.sh \| bash` | Default; international networks |
+| **Gitee domestic mirror** | `curl -fsSL https://gitee.com/rockchip-wardner/wardner/raw/master/install_gitee.sh \| bash` | Faster on domestic networks |
 
-> ⚠️ The path is **`/raw/master/`**. Writing `.../wardner/install.sh` gives you a web
+> ⚠️ The path is **`/raw/master/`**. Writing `.../wardner/install_github.sh` gives you a web
 > page, not the raw file — curl will 404, or feed a chunk of HTML to bash.
 
-### The source is decided by the URL you used
+### The source is declared by the entry script, not guessed
 
-The installer **hard-codes neither the organization nor the source site** — it works
-backwards from "which URL did it come from":
+`install_github.sh` / `install_gitee.sh` are two **entry scripts**. Each declares the
+source site it stands for (GitHub / Gitee) and then downloads the very same
+`install.sh` and runs it — the actual install logic exists exactly once, the entry
+scripts are thin shells.
+
+> ⚠️ **Why `curl ... | bash` cannot guess the source on its own**: install.sh is only
+> ~25KB, so it **fits into the pipe buffer in one go** — curl writes it and exits
+> immediately, and by the time the script scans `/proc` for curl's command line, curl
+> is long gone (measured: a 24KB script → no curl in `/proc`; 200KB → still there).
+> So the old "scan `/proc` to infer the source" path **fails almost every time**: you
+> install from Gitee, it quietly pulls from GitHub, and **nothing tells you**.
+>
+> The source now lives in the **file content**: the script name *is* the declaration,
+> with no runtime guessing.
 
 ```
-curl's URL ──▶ hostname ──▶ source site ──▶ transport scheme ──▶ clone URL for 9 repos
+entry script ──▶ declared source ──▶ transport scheme ──▶ clone URL for 9 repos
 ```
 
 * **GitHub / Gitee go over https** — public repos, an anonymous clone is enough: no
   account, no SSH key, so users who never logged in can install;
 * **The intranet goes over ssh** — the intranet GitLab's web port is 8080 (that is the
-  HTTP port); fetching the code over ssh is how an intranet should work.
+  HTTP port); fetching the code over ssh is how an intranet should work (when you
+  point `WARDNER_REPO_URL` at an intranet address yourself).
 
 So **if you install from Gitee, the host app, the 8 SDK / plugin packages and every
 later `wdn update` all go through Gitee**; if you install from GitHub, they all go
@@ -280,11 +293,12 @@ adding a package needs no change to the installer.
 | Variable | Default | Meaning |
 |---|---|---|
 | `WARDNER_HOME` | `~/.wardner` | install root |
-| `WARDNER_SOURCE_HOST` | inferred from the source URL | source site host (`github.com` / `gitee.com` / intranet address) |
+| `WARDNER_SELF_SOURCE_URL` | declared by the entry script | the source the **entry script** stands for (`install_github.sh` / `install_gitee.sh` each set their own) — ordinary users never touch it |
+| `WARDNER_SOURCE_HOST` | declared by the entry script | source site host (`github.com` / `gitee.com` / intranet address); an explicit value wins |
 | `WARDNER_SOURCE_SCHEME` | decided by the source site | `github.com` / `gitee.com` → `https`; everything else → `ssh` |
-| `WARDNER_ORG` | inferred from the source URL | organization |
-| `WARDNER_REPO_NAME` | inferred from the source URL | name of this repo |
-| `WARDNER_REPO_URL` | inferred from the source URL | URL of this repo |
+| `WARDNER_ORG` | inferred from the source site | organization; an explicit value wins |
+| `WARDNER_REPO_NAME` | inferred from the source site | name of this repo; an explicit value wins |
+| `WARDNER_REPO_URL` | inferred from the source site | URL of this repo — **highest priority**, an explicit value wins. Both a clone URL (`…/wardner.git`) and a file URL (`…/raw/master/install.sh`, normalized automatically) are accepted |
 | `WARDNER_HOST_REPO` | `wdnwebui` | host app repo name |
 | `WARDNER_PKG_BASE` | `git+https://<source-site>/<org>` | source prefix for the SDK / plugin packages |
 | `WARDNER_PYTHON` | `python3` | which python builds the venv |
@@ -331,12 +345,32 @@ cd ~/.wardner/wdnwebui
 .venv/bin/python scripts/check_sdk_deps.py    # full dependency audit
 ```
 
+**The source is wrong (you installed from Gitee, but the preflight says
+`源： github.com/…`).** Check that you used the **entry script**: `install_gitee.sh`
+is the Gitee source; `install.sh` is the internal implementation and carries **no**
+source declaration (it can only guess, and when the guess fails it falls back to
+GitHub with a warning):
+
+```bash
+curl -fsSL https://gitee.com/rockchip-wardner/wardner/raw/master/install_gitee.sh | bash
+```
+
+If you already installed from GitHub, re-running the entry script switches the
+source — each repo's remote is moved to the new source automatically:
+
+```bash
+curl -fsSL https://gitee.com/rockchip-wardner/wardner/raw/master/install_gitee.sh | bash
+```
+
+After the switch, `wdn update` follows the new source too — it reads the address
+recorded in this repo's remote.
+
 **Clone times out / GitHub is unreachable.** GitHub is unstable on international
 networks; this is common. **Switch to the Gitee mirror** (fast domestically, the
 content is identical to GitHub):
 
 ```bash
-curl -fsSL https://gitee.com/rockchip-wardner/wardner/raw/master/install.sh | bash
+curl -fsSL https://gitee.com/rockchip-wardner/wardner/raw/master/install_gitee.sh | bash
 ```
 
 If you already installed from GitHub, you can also make `wdn update` go through Gitee:

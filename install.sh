@@ -2,16 +2,20 @@
 # wdnwebui 一键安装器
 #
 #   ── GitHub（默认）────────────────────────────────────────────
-#   curl -fsSL https://github.com/rockchip-wardner/wardner/raw/master/install.sh | bash
+#   curl -fsSL https://github.com/rockchip-wardner/wardner/raw/master/install_github.sh | bash
 #
 #   ── Gitee 国内镜像（国内网络更快）────────────────────────────
-#   curl -fsSL https://gitee.com/rockchip-wardner/wardner/raw/master/install.sh | bash
+#   curl -fsSL https://gitee.com/rockchip-wardner/wardner/raw/master/install_gitee.sh | bash
 #
 # ⚠️ 注意是 **/raw/master/**，不能写成 .../wardner/install.sh —— 那是网页路由，
 #    不是原始文件地址（curl 会拿到 404 或一段 HTML）。
 #
-# 安装器**从你用的那个 URL 推断源站**：从 Gitee 装的，宿主应用和 8 个 SDK /
-# 插件包、以及后续的 `wdn update` 也都走 Gitee。
+# 安装器**知道自己属于哪个站**：源站由**入口脚本**声明 ——
+# install_github.sh / install_gitee.sh 各自声明 GitHub / Gitee 源，
+# 真正的安装逻辑在 install.sh（两个入口脚本只是薄壳，逻辑只有一份）。
+#
+# 从哪个源装的，宿主应用和 8 个 SDK / 插件包、以及后续的 `wdn update`
+# 全都跟着走。
 #
 # ⚠️ Gitee 是**只读镜像**（内容由上游自动同步）—— 从它拉没问题，**不要往它推**。
 #    需要推送请用 GitHub（或内网主仓库）。
@@ -30,6 +34,41 @@
 # SDK 声明依赖审计），这里**不重复实现**，只负责把代码拉到该在的位置。
 
 set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# 来源 URL 判定工具
+#
+# 这两个函数在 bootstrap 阶段就要用（那时 lib/urls.sh 还没 source），所以
+# 这里内联了一份 —— lib/urls.sh 里是**同套逻辑的副本**，**改一处必须改另一处**。
+# ---------------------------------------------------------------------------
+
+# 这个地址是「取文件地址」而不是「仓库地址」吗？
+#
+# raw 取文件 URL 当 clone 地址用会**直接失败** —— git 会去找用户名要密码
+# （实测 "could not read Username for 'https://gitee.com'"；有 TTY 时更是
+# 直接卡在密码提示上，用户以为安装器挂了）。
+source_url_is_file_url() {
+    case "${1:-}" in
+        */raw/*|*/blob/*) return 0 ;;
+        *.sh|*.py|*.json) return 0 ;;
+    esac
+    return 1
+}
+
+# URL → host（只用来比较两个地址是不是同一个站）。
+source_url_host() {
+    local u="${1:-}"
+    case "$u" in
+        git@*:*)
+            u="${u#git@}"; printf '%s' "${u%%:*}" ;;
+        ssh://*/*)
+            u="${u#ssh://}"; u="${u##*@}"; printf '%s' "${u%%/*}" ;;
+        http://*/*|https://*/*)
+            u="${u#*://}"; u="${u##*@}"; printf '%s' "${u%%/*}" ;;
+        *)
+            printf '%s' "$u" ;;
+    esac
+}
 
 # ---------------------------------------------------------------------------
 # Phase 0: bootstrap
@@ -66,17 +105,39 @@ if [ -z "${WARDNER_BOOTSTRAPPED:-}" ]; then
     # 来源 URL 反推**源站** + 组织 + 仓库名 —— 安装器因此是**自描述**的。
     #
     # 来源优先级：
-    #   1. WARDNER_REPO_URL 环境变量（显式覆盖）
-    #   2. curl 的命令行（`curl ... | bash` 时脚本自己不知道来源，但 curl
-    #      通常还在跑，/proc/<pid>/cmdline 里带着完整 URL）
-    #   3. 内置兜底
+    #   1. WARDNER_REPO_URL 环境变量 —— 用户显式指定，最高
+    #   2. WARDNER_SELF_SOURCE_URL —— **入口脚本自带**（install_github.sh /
+    #      install_gitee.sh 各自声明自己的源）。这是**主路径**
+    #   3. 已安装仓的 remote —— 续装 / update.sh 时以现状为准，不换源
+    #   4. curl 的命令行 —— 兜底（`curl ... | bash` 时 curl 常已退出）
+    #   5. 内置兜底 —— 会**告警**，绝不静默换源
+    #
+    # ⚠️ 第 2 条是主路径，因为 `curl ... | bash` 时脚本**可靠地**知道自己从
+    #    哪来，靠的不是运行时探测，而是**文件内容**：install.sh 只有 ~25KB，
+    #    一次就能塞进管道缓冲区，curl 写完立刻退出，等脚本扫 /proc 时 curl
+    #    早就没了（实测 24KB 脚本 → /proc 里没有 curl；200KB → 还在）。
+    #    所以「入口脚本声明源站」比「扫 /proc 猜源站」可靠得多 —— 第 4 条
+    #    只是历史兜底。
     #
     # ⚠️ 这段在 source lib/*.sh **之前**跑（那时还不知道脚本目录），
     #    所以 url 解析逻辑在这里内联了一份 —— lib/urls.sh 是同套逻辑的副本，
     #    **改一处必须改另一处**。
-    _src="${WARDNER_REPO_URL:-}"
-    _explicit=0
-    [ -n "$_src" ] && _explicit=1
+    # >>> 来源解析开始（scripts/verify_source_selection.sh 按这两个标记抽取本段做回归）
+    _src=""
+    _src_kind=""
+    if [ -n "${WARDNER_REPO_URL:-}" ]; then
+        _src="$WARDNER_REPO_URL"
+        _src_kind="user"
+    elif [ -n "${WARDNER_SELF_SOURCE_URL:-}" ]; then
+        _src="$WARDNER_SELF_SOURCE_URL"
+        _src_kind="self"
+    elif [ -d "$WARDNER_HOME/${WARDNER_REPO_NAME:-wardner}/.git" ]; then
+        # 已经装过了 —— 以**现有 remote** 为准（remote 是事实，推断归推断）。
+        # 这条让 update.sh / 重跑安装器**不会**把源站换掉。
+        _src="$(git -C "$WARDNER_HOME/${WARDNER_REPO_NAME:-wardner}" \
+                    remote get-url origin 2>/dev/null || true)"
+        [ -n "$_src" ] && _src_kind="installed"
+    fi
     if [ -z "$_src" ]; then
         for _p in /proc/[0-9]*; do
             # ⚠️ `2>/dev/null` 必须写在输入重定向**之前**，顺序不能反。
@@ -89,10 +150,21 @@ if [ -z "${WARDNER_BOOTSTRAPPED:-}" ]; then
             _cmd="$(tr '\0' ' ' 2>/dev/null < "$_p/cmdline")" || continue
             case "$_cmd" in *curl*install.sh*) ;; *) continue ;; esac
             _u="$(printf '%s\n' "$_cmd" | grep -oE 'https?://[^ ]+' | head -1)"
-            [ -n "$_u" ] && { _src="$_u"; break; }
+            [ -n "$_u" ] && { _src="$_u"; _src_kind="probe"; break; }
         done
     fi
-    [ -z "$_src" ] && _src="https://github.com/rockchip-wardner/wardner/raw/master/install.sh"
+    if [ -z "$_src" ]; then
+        _src="https://github.com/rockchip-wardner/wardner/raw/master/install.sh"
+        _src_kind="default"
+        # 兜底**必须告警** —— 静默换源是本脚本最难查的一类 bug：
+        # 用户从 Gitee 装，却悄悄从 GitHub 拉，而且没有任何提示。
+        printf '\033[1;33m[warn]\033[0m 没能确定来源 URL（/proc 里找不到 curl —— 它在脚本读完前就退出了）\n' >&2
+        printf '       将使用内置默认源： github.com/rockchip-wardner/wardner\n' >&2
+        printf '       要用别的源，请用对应的**入口脚本**（源站由脚本名声明）：\n' >&2
+        printf '         install_github.sh  →  GitHub 源\n' >&2
+        printf '         install_gitee.sh   →  Gitee 源\n' >&2
+        printf '       或显式指定： export WARDNER_REPO_URL=https://<host>/<org>/<repo>.git\n' >&2
+    fi
 
     # 解析来源 URL → "<host> <org> <repo>"。
     #
@@ -132,6 +204,20 @@ if [ -z "${WARDNER_BOOTSTRAPPED:-}" ]; then
         _host="github.com"; _org="rockchip-wardner"; _repo="wardner"
     fi
 
+    # 用户显式设的（环境变量）**覆盖**解析结果 —— 与 README 的环境变量表一致。
+    # 之前是无条件覆盖，用户 export 了也没用（只有 wdn update 阶段有效）。
+    _env_override=0
+    if [ -n "${WARDNER_SOURCE_HOST:-}" ] || [ -n "${WARDNER_ORG:-}" ] \
+       || [ -n "${WARDNER_REPO_NAME:-}" ]; then
+        _env_override=1
+    fi
+    : "${WARDNER_SOURCE_HOST:=$_host}"
+    : "${WARDNER_ORG:=$_org}"
+    : "${WARDNER_REPO_NAME:=$_repo}"
+    _host="$WARDNER_SOURCE_HOST"
+    _org="$WARDNER_ORG"
+    _repo="$WARDNER_REPO_NAME"
+
     WARDNER_SOURCE_HOST="$_host"
     # 协议由**源站**决定：GitHub / Gitee 走 https（公开仓，匿名 clone），
     # 内网走 ssh（内网 GitLab 的 web 口在 8080，那是 HTTP 端口，取码用 ssh）。
@@ -143,20 +229,33 @@ if [ -z "${WARDNER_BOOTSTRAPPED:-}" ]; then
         *)                     _scheme="ssh" ;;
     esac
     WARDNER_SOURCE_SCHEME="$_scheme"
-    WARDNER_ORG="$_org"
-    WARDNER_REPO_NAME="$_repo"
     export WARDNER_SOURCE_HOST WARDNER_SOURCE_SCHEME WARDNER_ORG WARDNER_REPO_NAME
 
-    # 用户显式给了 clone 地址就**原样用** —— 里面可能有 port、SSH 形式、
-    # 内网 GitLab 的路径前缀，推测出来的地址未必等价。
-    if [ "$_explicit" -eq 1 ]; then
+    # clone 地址怎么来：
+    #
+    # * **用户显式给了 clone 地址**（WARDNER_REPO_URL）→ **原样用** —— 里面
+    #   可能有 port、SSH 形式、内网 GitLab 的路径前缀，推测出来的地址未必等价。
+    # * **取文件地址**（含 /raw/ /blob/，或末段是文件名）→ 那不是 clone 地址，
+    #   原样用会让 git 去找用户名要密码（实测 "could not read Username for
+    #   'https://gitee.com'"，有 TTY 时更是直接卡在密码提示上）→ 按解析出的
+    #   host/org/repo 重新构造。
+    # * **用户改了 host / org / repo** → 自带的地址已经对不上了 → 重新构造。
+    # * 其余 → 原样用（入口脚本给的、已装仓的 remote 本身就是权威地址）。
+    #
+    # ⚠️ 这段判断在 lib/urls.sh::source_url_is_file_url 里也有一份 ——
+    #    bootstrap 阶段还没 source lib/，只能内联。改一处必须改另一处。
+    if [ "$_src_kind" = "user" ] && ! source_url_is_file_url "$_src"; then
         WARDNER_REPO_URL="$_src"
-    else
+    elif source_url_is_file_url "$_src" || [ "$_env_override" -eq 1 ]; then
         case "$_scheme" in
             ssh) WARDNER_REPO_URL="git@${_host%%:*}:$_org/$_repo.git" ;;
             *)   WARDNER_REPO_URL="https://$_host/$_org/$_repo.git" ;;
         esac
+    else
+        WARDNER_REPO_URL="$_src"
     fi
+    export WARDNER_REPO_URL
+    # <<< 来源解析结束
     _repo_dir="$WARDNER_HOME/$WARDNER_REPO_NAME"
 
     mkdir -p "$WARDNER_HOME"
@@ -173,6 +272,16 @@ if [ -z "${WARDNER_BOOTSTRAPPED:-}" ]; then
     _try=1
     while true; do
         if [ -d "$_repo_dir/.git" ]; then
+            # 换源时把 remote 指到新源 —— `git pull` **不会**改 remote URL，
+            # 不改的话「从 Gitee 装」会继续从旧的 GitHub remote 拉，
+            # resolve_source() 也会一直显示旧的源站。
+            _old_remote="$(git -C "$_repo_dir" remote get-url origin 2>/dev/null || true)"
+            if [ -n "$_old_remote" ] \
+               && [ "$(source_url_host "$_old_remote")" != "$WARDNER_SOURCE_HOST" ]; then
+                git -C "$_repo_dir" remote set-url origin "$WARDNER_REPO_URL" >/dev/null 2>&1 || true
+                printf '  \033[1;33m[warn]\033[0m %s 的 remote 已切到新源： %s\n' \
+                    "$WARDNER_REPO_NAME" "$WARDNER_REPO_URL" >&2
+            fi
             git -C "$_repo_dir" -c "http.lowSpeedLimit=$WARDNER_GIT_LOW_SPEED_LIMIT" \
                 -c "http.lowSpeedTime=$WARDNER_GIT_LOW_SPEED_TIME" \
                 pull --ff-only >/dev/null 2>&1 && break

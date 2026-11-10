@@ -84,6 +84,39 @@ parse_repo_url() {
     printf '%s %s %s\n' "$host" "$org" "$repo"
 }
 
+# 这个地址是「取文件地址」而不是「仓库地址」吗？
+#
+# raw 取文件 URL 当 clone 地址用会**直接失败** —— git 会去找用户名要密码
+# （实测 "could not read Username for 'https://gitee.com'"；有 TTY 时更是
+# 直接卡在密码提示上，用户以为安装器挂了）。
+#
+# ⚠️ install.sh 的 bootstrap 段里有一份**内联副本**（那时还没 source
+#    lib/urls.sh）—— **改一处必须改另一处**。
+source_url_is_file_url() {
+    case "${1:-}" in
+        */raw/*|*/blob/*) return 0 ;;
+        *.sh|*.py|*.json) return 0 ;;
+    esac
+    return 1
+}
+
+# URL → host（只用来比较两个地址是不是同一个站）。
+#
+# ⚠️ install.sh 的 bootstrap 段里有一份**内联副本** —— 改一处必须改另一处。
+source_url_host() {
+    local u="${1:-}"
+    case "$u" in
+        git@*:*)
+            u="${u#git@}"; printf '%s' "${u%%:*}" ;;
+        ssh://*/*)
+            u="${u#ssh://}"; u="${u##*@}"; printf '%s' "${u%%/*}" ;;
+        http://*/*|https://*/*)
+            u="${u#*://}"; u="${u##*@}"; printf '%s' "${u%%/*}" ;;
+        *)
+            printf '%s' "$u" ;;
+    esac
+}
+
 # 仓库的 git clone 地址
 repo_clone_url() {
     repo_clone_url_for https "$@"

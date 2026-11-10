@@ -138,6 +138,16 @@ fetch_repo() {
     url="$(repo_clone_url_for "$WARDNER_SOURCE_SCHEME" "$WARDNER_SOURCE_HOST" "$WARDNER_ORG" "$name")"
 
     if [ -d "$dir/.git" ]; then
+        # 换源时把 remote 指到新源 —— `git pull` **不会**改 remote URL，
+        # 不改的话源站永远停在第一次装的那个。
+        local old_remote new_host
+        old_remote="$(git -C "$dir" remote get-url origin 2>/dev/null || true)"
+        new_host="$(source_url_host "$old_remote")"
+        if [ -n "$old_remote" ] && [ "$new_host" != "$WARDNER_SOURCE_HOST" ]; then
+            git -C "$dir" remote set-url origin "$url" >/dev/null 2>&1 || true
+            log "$name 的 remote 已切到新源： $url"
+        fi
+
         log "更新 $name"
         if ! git_retry "git pull $name" \
             git -C "$dir" "${GIT_NET_OPTS[@]}" pull --ff-only; then

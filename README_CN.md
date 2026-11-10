@@ -10,25 +10,34 @@ Rockchip 平台 Web 服务（[wdnwebui](https://github.com/rockchip-wardner/wdnw
 
 | 源 | 一键命令 | 什么时候用 |
 |---|---|---|
-| **GitHub** | `curl -fsSL https://github.com/rockchip-wardner/wardner/raw/master/install.sh \| bash` | 默认；国际网络 |
-| **Gitee 国内镜像** | `curl -fsSL https://gitee.com/rockchip-wardner/wardner/raw/master/install.sh \| bash` | 国内网络更快 |
+| **GitHub** | `curl -fsSL https://github.com/rockchip-wardner/wardner/raw/master/install_github.sh \| bash` | 默认；国际网络 |
+| **Gitee 国内镜像** | `curl -fsSL https://gitee.com/rockchip-wardner/wardner/raw/master/install_gitee.sh \| bash` | 国内网络更快 |
 
-> ⚠️ 路径是 **`/raw/master/`**。写成 `.../wardner/install.sh` 拿到的是网页
+> ⚠️ 路径是 **`/raw/master/`**。写成 `.../wardner/install_github.sh` 拿到的是网页
 > 路由，不是原始文件 —— curl 会 404，或者把一段 HTML 喂给 bash。
 
-### 源由你用的那条 URL 决定
+### 源由**入口脚本**声明，不是靠猜的
 
-安装器**不硬编码组织名，也不硬编码源站** —— 它从「自己是从哪个 URL 拉下来的」
-反推：
+`install_github.sh` / `install_gitee.sh` 是两个**入口脚本**，各自声明自己代表的源站
+（GitHub / Gitee），然后下载同一个 `install.sh` 执行 —— 真正的安装逻辑只有一份，
+两个入口脚本是薄壳。
+
+> ⚠️ **为什么不能只靠 `curl ... | bash` 猜来源**：install.sh 只有 ~25KB，**一次就能
+> 塞进管道缓冲区** —— curl 写完就退出了，等脚本扫 `/proc` 想从 curl 的命令行里读
+> URL 时，它早就没了（实测：24KB 的脚本 → `/proc` 里没有 curl；200KB → 还在）。
+> 所以「扫 `/proc` 推断来源」这条老路在绝大多数情况下**必然落空**：用户从 Gitee
+> 装，却悄悄从 GitHub 拉，而且**没有任何提示**。
+>
+> 现在来源写在**文件内容**里：脚本名即声明，不依赖运行时探测。
 
 ```
-curl 的 URL ──▶ 主机名 ──▶ 源站 ──▶ 传输协议 ──▶ 9 个仓的 clone 地址
+入口脚本 ──▶ 声明源站 ──▶ 传输协议 ──▶ 9 个仓的 clone 地址
 ```
 
 * **GitHub / Gitee 走 https** —— 公开仓，匿名 clone 就行，不需要账号、
   不需要 SSH key，所以没登录过的用户也能装；
 * **内网走 ssh** —— 内网 GitLab 的 web 口在 8080（那是 HTTP 端口），
-  取码走 ssh 才是内网该有的方式。
+  取码走 ssh 才是内网该有的方式（自己设 `WARDNER_REPO_URL` 指到内网时）。
 
 所以**从 Gitee 装的，宿主应用和 8 个 SDK / 插件包、以及后续的 `wdn update`，
 全都走 Gitee**；从 GitHub 装的就全走 GitHub。不用配任何环境变量。
@@ -247,11 +256,12 @@ WARDNER_ORG=your-org ~/.wardner/wardner/install.sh
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `WARDNER_HOME` | `~/.wardner` | 安装根目录 |
-| `WARDNER_SOURCE_HOST` | 由来源 URL 推断 | 源站主机（`github.com` / `gitee.com` / 内网地址） |
+| `WARDNER_SELF_SOURCE_URL` | 由入口脚本声明 | **入口脚本声明的源站**（`install_github.sh` / `install_gitee.sh` 各自设自己的）—— 普通用户不用管 |
+| `WARDNER_SOURCE_HOST` | 由入口脚本声明 | 源站主机（`github.com` / `gitee.com` / 内网地址）；显式设置可覆盖 |
 | `WARDNER_SOURCE_SCHEME` | 由源站决定 | `github.com` / `gitee.com` → `https`；其余 → `ssh` |
-| `WARDNER_ORG` | 由来源 URL 推断 | 组织 |
-| `WARDNER_REPO_NAME` | 由来源 URL 推断 | 本仓名 |
-| `WARDNER_REPO_URL` | 由来源 URL 推断 | 本仓地址 |
+| `WARDNER_ORG` | 由源站推断 | 组织；显式设置可覆盖 |
+| `WARDNER_REPO_NAME` | 由源站推断 | 本仓名；显式设置可覆盖 |
+| `WARDNER_REPO_URL` | 由源站推断 | 本仓地址 —— **优先级最高**，显式设置就以它为准。clone 地址（`…/wardner.git`）或取文件地址（`…/raw/master/install.sh`，自动归一化）都能填 |
 | `WARDNER_HOST_REPO` | `wdnwebui` | 宿主应用仓名 |
 | `WARDNER_PKG_BASE` | `git+https://<源站>/<组织>` | SDK / 插件包来源前缀 |
 | `WARDNER_PYTHON` | `python3` | 用哪个 python 建 venv |
@@ -295,11 +305,28 @@ cd ~/.wardner/wdnwebui
 .venv/bin/python scripts/check_sdk_deps.py    # 全量依赖审计
 ```
 
+**源站不对（明明从 Gitee 装的，前置检查里却显示 `源： github.com/…`）。**
+先确认用的是**入口脚本**：`install_gitee.sh` 才是 Gitee 源；
+`install.sh` 是内部实现，**不含**源站声明（它只能靠运行时探测，探测不到就回落
+GitHub 并打告警）：
+
+```bash
+curl -fsSL https://gitee.com/rockchip-wardner/wardner/raw/master/install_gitee.sh | bash
+```
+
+已经用 GitHub 装好的，重跑一次入口脚本就换源了（各仓的 remote 会自动切到新源）：
+
+```bash
+curl -fsSL https://gitee.com/rockchip-wardner/wardner/raw/master/install_gitee.sh | bash
+```
+
+换源之后 `wdn update` 也跟着走新源 —— 它读的是本仓 remote 里写着的地址。
+
 **克隆超时 / GitHub 连不上。** 国际网络下 GitHub 不稳很常见。**直接改用 Gitee
 镜像**（国内快，代码内容与 GitHub 一致）：
 
 ```bash
-curl -fsSL https://gitee.com/rockchip-wardner/wardner/raw/master/install.sh | bash
+curl -fsSL https://gitee.com/rockchip-wardner/wardner/raw/master/install_gitee.sh | bash
 ```
 
 已经用 GitHub 装好的，也可以让 `wdn update` 改走 Gitee：
