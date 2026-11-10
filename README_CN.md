@@ -82,8 +82,14 @@ Rockchip 平台 Web 服务（[wdnwebui](https://github.com/rockchip-wardner/wdnw
 启动：
 
 ```bash
+wdn start 8000                   # 后台跑 → http://<板子IP>:8000/
+```
+
+前台跑（能看着日志）：
+
+```bash
 cd ~/.wardner/wdnwebui
-.venv/bin/python run.py        # http://<板子IP>:8000/
+.venv/bin/python run.py
 ```
 
 更新：
@@ -138,8 +144,42 @@ wdn update                     # 推荐：更新所有仓 + 重新同步 venv
 ```bash
 wdn update      # 把所有已下载的仓更新到源站最新，并重新同步 venv
 wdn status      # 看各仓的 commit / remote 和 venv 状态
+wdn start 8080  # 后台启动 wdnwebui 服务，监听 8080 端口
+wdn stop        # 停掉 wdnwebui 服务
 wdn version     # 版本号
 ```
+
+### `wdn start` / `wdn stop` —— 跑 Web 服务
+
+```bash
+wdn start 8080     # 监听 8080（端口可省略，默认 8000）
+wdn stop           # 再停掉
+```
+
+`wdn start` 把服务**跑在后台** —— 等 web UI 在 `/health` 上应答了就返回，并把要打开的
+地址打出来：
+
+```
+▶ starting wdnwebui on port 8080
+  ● wdnwebui started (pid 559670)
+  ● the web UI is listening on http://192.168.169.215:8080/
+```
+
+| | |
+|---|---|
+| pid 文件 | `~/.wardner/run/wdnwebui.pid` |
+| 日志 | `~/.wardner/logs/wdnwebui.log` |
+
+服务跑在**自己的 session** 里 —— 启动它的终端关掉也不影响；`wdn stop` 停的是整个进程组，
+uvicorn 的 reloader 和它派生的 worker 一起下去。`wdn stop` 会一直等到端口真的释放才
+返回，所以 `wdn stop` + `wdn start` 不会撞上 `[Errno 98] Address already in use`。
+
+不需要 root，也不需要 systemd —— pid 文件 + 进程组在任何装法下行为一致。如果这个服务
+是 **systemd** 管的（`wdnwebui/install_autostart.sh` 装的开机自启单元），`wdn stop` 会
+把话说明白并让你用 `systemctl stop`，不跟 systemd 抢着杀。
+
+`compute_worker` 是**故意**用独立 session 起的 —— 它们停服务后还活着，下次启动会被
+DDS 重新接管。
 
 ### `wdn update` 做三件事
 
@@ -167,8 +207,10 @@ wdn version     # 版本号
 服务还在跑旧代码的话，更新完重启它：
 
 ```bash
-cd ~/.wardner/wdnwebui && .venv/bin/python run.py
+wdn stop && wdn start 8080
 ```
+
+（想看着日志前台跑：`cd ~/.wardner/wdnwebui && .venv/bin/python run.py`。）
 
 > 装完之后，**当前**终端还没生效 —— 新开一个终端，或 `source ~/.bashrc`
 > （zsh 是 `source ~/.zshrc`）。用 zsh 登录的板子根本不会读 `~/.bashrc`，
@@ -288,7 +330,7 @@ WARDNER_ORG=your-org ~/.wardner/wardner/install.sh
 **装完卡片没出现。** 卡片是开机时扫 entry point 的，装完要重启服务：
 
 ```bash
-cd ~/.wardner/wdnwebui && .venv/bin/python run.py
+wdn stop && wdn start 8000
 ```
 
 **算力页报「功能未启用」。** 说明 `wdndds` 的 `.so` 没编出来。安装器不自行

@@ -9,6 +9,9 @@
 #                  system libraries of the hardware engines (MPP / RGA /
 #                  Mali / RKNN), the SDK versions, the dependency
 #                  versions, the plugin registration
+#   wdn start      start the wdnwebui service in the background and listen
+#                  on the given port (default 8000)
+#   wdn stop       stop the wdnwebui service
 #   wdn version    print the version
 #
 # Two layers:

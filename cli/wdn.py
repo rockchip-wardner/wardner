@@ -10,6 +10,9 @@ Subcommands
   doctor    check the system environment: the native .so files, the **system
             libraries of the hardware engines** (MPP / RGA / Mali / RKNN),
             the SDK versions, the dependency versions, the plugin registration
+  start     start the wdnwebui service in the background and listen on the
+            given port (default 8000)
+  stop      stop the wdnwebui service
   version   print the version
 
 Runs with the **venv python** (see bin/wdn)
@@ -46,12 +49,16 @@ reimplemented here.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import shutil
+import signal
+import socket
 import subprocess
 import sys
 import time
+import urllib.request
 from pathlib import Path
 
 VERSION = "1.0.0"
@@ -798,6 +805,577 @@ def cmd_version(args: argparse.Namespace) -> int:
     print(f"  installer     {wardner_repo()}")
     print(f"  host app      {host_repo()}")
     print(f"  venv python   {venv_python()}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Subcommands: start / stop
+#
+# The webui runs **detached** from the CLI: the CLI spawns it in its own
+# session (setsid) with the output redirected to a log file, and records
+# the PID in a pid file. `wdn stop` reads that file and signals the whole
+# process group.
+#
+# Why not systemd? `wdn start` has to work as a plain user: the board's
+# autostart unit needs root (see wdnwebui/install_autostart.sh) and a
+# systemd *user* session is not guaranteed to be running on a board that
+# is only reachable over ssh. A pid file + a process group behaves the
+# same on every install.
+#
+# The compute_workers are spawned with ``start_new_session=True`` (see
+# app/core/compute/registry.py) ⇒ they detach from our process group and
+# survive the stop by design — the next boot adopts them over DDS. Same
+# policy as the stale sweep in wdnwebui/run.py.
+# ---------------------------------------------------------------------------
+
+DEFAULT_PORT = 8000
+
+
+def _service_dir() -> Path:
+    """<wardner_home>/run — the pid file lives here."""
+    return wardner_home() / "run"
+
+
+def _pid_file() -> Path:
+    return _service_dir() / "wdnwebui.pid"
+
+
+def _log_file() -> Path:
+    return wardner_home() / "logs" / "wdnwebui.log"
+
+
+def _pid_alive(pid: int) -> bool:
+    """Is the pid alive? A process we may not signal still counts."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _proc_cmdline(pid: int) -> str:
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            return f.read().replace(b"\0", b" ").decode("utf-8", "replace").strip()
+    except OSError:
+        return ""
+
+
+def _port_holder(port: int) -> int | None:
+    """The PID holding the TCP port in LISTEN, or None.
+
+    Uses ``ss -tlnp`` (iproute2) — universal on Linux, and it avoids
+    depending on lsof (not installed everywhere).
+    """
+    try:
+        out = subprocess.run(
+            ["ss", "-tlnp", f"sport = :{port}"],
+            capture_output=True, text=True, timeout=3,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    if out.returncode != 0:
+        return None
+    m = re.search(r"pid=(\d+)", out.stdout)
+    return int(m.group(1)) if m else None
+
+
+def _http_ok(port: int, timeout: float = 2.0) -> bool:
+    """GET /health on the local port — the real readiness probe.
+
+    "the port is bound" is not enough: uvicorn binds before the app has
+    finished booting, and a request that comes back 200 proves the whole
+    stack (config, the app, the static files) is actually serving.
+    """
+    try:
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/health", timeout=timeout
+        ) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
+
+
+def _lan_ip() -> str:
+    """The address of this board on the LAN (no traffic is sent).
+
+    A UDP "connect" only picks the route — nothing is transmitted.
+    """
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.settimeout(0.5)
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+
+
+def _read_pid_file() -> dict | None:
+    p = _pid_file()
+    if not p.is_file():
+        return None
+    try:
+        data = json.loads(p.read_text())
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _service_processes() -> list[tuple[int, str]]:
+    """The live wdnwebui processes of this repo: (pid, cmdline).
+
+    Only the processes whose CWD is the host repo count — a wdnwebui of
+    another checkout on the same board must not be touched.
+    """
+    hrepo = host_repo()
+    try:
+        root = str(hrepo.resolve())
+    except OSError:
+        root = str(hrepo)
+    out: list[tuple[int, str]] = []
+    try:
+        pids = sorted(int(p) for p in os.listdir("/proc") if p.isdigit())
+    except OSError:
+        return out
+    me = os.getpid()
+    for pid in pids:
+        if pid == me:
+            continue
+        cmd = _proc_cmdline(pid)
+        if not cmd:
+            continue
+        if "run.py" not in cmd and "app.main:app" not in cmd:
+            continue
+        try:
+            cwd = os.readlink(f"/proc/{pid}/cwd")
+        except OSError:
+            continue
+        if cwd != root:
+            continue
+        out.append((pid, cmd))
+    return out
+
+
+def _systemd_unit(pid: int) -> str | None:
+    """The systemd unit that owns the process, if any."""
+    try:
+        with open(f"/proc/{pid}/cgroup") as f:
+            raw = f.read()
+    except OSError:
+        return None
+    units = re.findall(r"([A-Za-z0-9_.@:-]+\.service)\b", raw)
+    return units[-1] if units else None
+
+
+def _orphan_workers() -> list[int]:
+    """The compute_workers of this repo (they survive the stop by design)."""
+    hrepo = host_repo()
+    try:
+        root = str(hrepo.resolve())
+    except OSError:
+        root = str(hrepo)
+    out: list[int] = []
+    try:
+        pids = sorted(int(p) for p in os.listdir("/proc") if p.isdigit())
+    except OSError:
+        return out
+    for pid in pids:
+        cmd = _proc_cmdline(pid)
+        if "compute_worker.py" not in cmd:
+            continue
+        try:
+            if os.readlink(f"/proc/{pid}/cwd") != root:
+                continue
+        except OSError:
+            continue
+        out.append(pid)
+    return out
+
+
+def _ppid_of(pid: int) -> int | None:
+    """The parent pid of the process, or None."""
+    try:
+        with open(f"/proc/{pid}/status") as f:
+            for line in f:
+                if line.startswith("PPid:"):
+                    return int(line.split()[1])
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+def _is_repo_process(pid: int) -> bool:
+    """Is the pid one of this repo's webui processes?
+
+    Used to tell "the port is held by a leftover of an earlier run"
+    (which the stale sweep in wdnwebui/run.py reaps) from "the port is
+    held by something else" (which the sweep would not touch).
+    """
+    try:
+        cwd = os.readlink(f"/proc/{pid}/cwd")
+    except OSError:
+        return False
+    try:
+        root = str(host_repo().resolve())
+    except OSError:
+        root = str(host_repo())
+    if cwd != root:
+        return False
+    cmd = _proc_cmdline(pid)
+    # run.py — the reloader parent; app.main:app — the systemd unit;
+    # multiprocessing.spawn — the uvicorn worker it forked.
+    return any(k in cmd for k in ("run.py", "app.main:app", "multiprocessing.spawn"))
+
+
+def _descendant_pids(pid: int) -> list[int]:
+    """All descendants of the pid (children, grandchildren, …).
+
+    ⚠️ **NOT** via ``/proc/<pid>/task/<pid>/children``: that file needs
+    ``CONFIG_PROC_CHILDREN``, and the kernel of this board does **not**
+    set it (verified in /boot/config: ``# CONFIG_PROC_CHILDREN is not
+    set``) — the file simply does not exist, so a walk over it would
+    silently return nothing and the caller would believe the process has
+    no children.
+
+    The parent relation is read from ``/proc/<pid>/status`` (PPid)
+    instead: one scan of /proc, then the tree is built in memory.
+    """
+    children: dict[int, list[int]] = {}
+    try:
+        pids = sorted(int(p) for p in os.listdir("/proc") if p.isdigit())
+    except OSError:
+        return []
+    for p in pids:
+        ppid = _ppid_of(p)
+        if ppid:
+            children.setdefault(ppid, []).append(p)
+
+    out: list[int] = []
+    stack = list(children.get(pid, []))
+    seen = {pid}
+    while stack:
+        cur = stack.pop()
+        if cur in seen:
+            continue
+        seen.add(cur)
+        out.append(cur)
+        stack.extend(children.get(cur, []))
+    return out
+
+
+def _terminate_group(
+    pid: int,
+    port: int | None = None,
+    exclusive_group: bool = True,
+    grace: float = 15.0,
+) -> bool:
+    """Stop the service and wait until it is really gone.
+
+    ``exclusive_group=True`` means "this process group belongs to the
+    service alone" — that is the case for an instance started by
+    ``wdn start`` (it is spawned with ``start_new_session=True``), so the
+    whole group can be signalled.
+
+    ``exclusive_group=False`` is for an instance that somebody else
+    started: its process group may well contain an interactive shell, and
+    signalling the group would take that shell down with it. There only
+    the process itself and its descendants are signalled.
+
+    The wait is on the **process tree**, not on the pid: the group leader
+    is the shell wrapper, which dies at once, while uvicorn keeps the
+    socket until its graceful shutdown is done (the app caps that at 10s
+    — see ``timeout_graceful_shutdown`` in wdnwebui/run.py). Returning
+    before the worker is gone would let the next `wdn start` fail with
+    [Errno 98].
+
+    The ``compute_worker`` processes are **not** signalled: they are
+    spawned with their own session on purpose, they survive the stop and
+    the next boot adopts them again over DDS (the same policy as the
+    stale sweep in wdnwebui/run.py).
+
+    Returns True when the service is really gone.
+    """
+    try:
+        pgid = os.getpgid(pid)
+    except (ProcessLookupError, PermissionError):
+        pgid = pid
+    # Never signal our own group — that would kill the CLI too.
+    same_group = pgid == os.getpgid(0)
+    group_ok = exclusive_group and not same_group
+
+    # The tree is snapshotted **before** the kill: once the parent dies
+    # its children are reparented to init, and the walk would not find
+    # them any more — the wait would then be over while the server was
+    # still shutting down.
+    tree = [pid] + [p for p in _descendant_pids(pid)
+                    if "compute_worker.py" not in _proc_cmdline(p)]
+
+    def _signal_tree(sig: int) -> None:
+        if group_ok:
+            try:
+                os.killpg(pgid, sig)
+                return
+            except (ProcessLookupError, PermissionError):
+                pass
+        # The reloader parent first: it shuts its worker down cleanly.
+        for target in tree:
+            try:
+                os.kill(target, sig)
+            except (ProcessLookupError, PermissionError):
+                pass
+
+    _signal_tree(signal.SIGTERM)
+
+    deadline = time.time() + grace
+    while time.time() < deadline:
+        holder = _port_holder(port) if port else None
+        alive = [p for p in tree if _pid_alive(p)]
+        if not holder and not alive:
+            return True
+        time.sleep(0.2)
+
+    # Something survived the grace period — take the port holder down
+    # hard, then the rest of the tree. The holder is signalled *with* the
+    # reloader: killing the worker alone would just make the reloader
+    # spawn a new one and take the port back.
+    holder = _port_holder(port) if port else None
+    if holder:
+        try:
+            os.kill(holder, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+    for target in tree:
+        try:
+            os.kill(target, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+    if group_ok:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+    time.sleep(0.5)
+
+    if port:
+        return _port_holder(port) is None
+    return not any(_pid_alive(p) for p in tree)
+
+
+def _ports_of_pid(pid: int) -> list[int]:
+    """The TCP ports the pid is listening on."""
+    try:
+        out = subprocess.run(
+            ["ss", "-tlnp"], capture_output=True, text=True, timeout=3,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return []
+    ports: list[int] = []
+    for line in out.stdout.splitlines():
+        if not re.search(rf"pid={pid}[,)]", line):
+            continue
+        fields = line.split()
+        if len(fields) < 4 or ":" not in fields[3]:
+            continue
+        try:
+            ports.append(int(fields[3].rsplit(":", 1)[1]))
+        except ValueError:
+            continue
+    return ports
+
+
+def _print_log_tail(log: Path, lines: int = 20) -> None:
+    try:
+        content = log.read_text(errors="replace").splitlines()
+    except OSError:
+        return
+    if not content:
+        return
+    note(f"the last {min(lines, len(content))} lines of {log}:")
+    for line in content[-lines:]:
+        print(f"    {C_DIM}{line}{C_RST}")
+
+
+def _print_service_urls(port: int) -> None:
+    ip = _lan_ip()
+    ok(f"the web UI is listening on http://{ip}:{port}/")
+    if ip != "127.0.0.1":
+        note(f"also reachable at http://127.0.0.1:{port}/")
+
+
+def cmd_start(args: argparse.Namespace) -> int:
+    port = args.port
+    hrepo = host_repo()
+
+    if not (1 <= port <= 65535):
+        bad(f"invalid port: {port} (must be 1..65535)")
+        return 2
+
+    if not venv_python().is_file():
+        bad("the venv is missing — run the installer first")
+        return 1
+    entry = hrepo / "run.py"
+    if not entry.is_file():
+        bad(f"the host app is missing: {entry}")
+        return 1
+
+    step(f"starting wdnwebui on port {port}")
+
+    # --- is it already running? ---
+    state = _read_pid_file()
+    if state:
+        pid = int(state.get("pid") or 0)
+        if pid and _pid_alive(pid):
+            running_port = state.get("port", port)
+            if running_port == port:
+                ok(f"wdnwebui is already running on port {port} (pid {pid})")
+                _print_service_urls(port)
+                return 0
+            bad(f"wdnwebui is already running on port {running_port} (pid {pid})")
+            note("stop it first:  wdn stop")
+            return 1
+        # a leftover pid file of a process that is gone
+        _pid_file().unlink(missing_ok=True)
+
+    # --- is the port taken by somebody else? ---
+    holder = _port_holder(port)
+    if holder:
+        if _is_repo_process(holder):
+            # A leftover of an earlier run. The stale sweep of
+            # wdnwebui/run.py reaps it — let the start go through.
+            note(f"port {port} is held by a leftover wdnwebui (pid {holder}) "
+                 f"— it will be reaped")
+        else:
+            bad(f"port {port} is already in use by pid {holder}")
+            note(_proc_cmdline(holder) or "(the cmdline is not readable)")
+            note("pick another port, or stop that process first")
+            return 1
+
+    # --- spawn it ---
+    # run.sh is the repo's own entry point: it brings up the USB HID
+    # gadget first and then runs run.py. Fall back to run.py when the
+    # wrapper is not there.
+    if (hrepo / "run.sh").is_file():
+        cmd = ["bash", str(hrepo / "run.sh"), "--port", str(port)]
+    else:
+        cmd = [str(venv_python()), str(entry), "--port", str(port)]
+
+    log = _log_file()
+    log.parent.mkdir(parents=True, exist_ok=True)
+    banner = (f"===== wdn start {time.strftime('%Y-%m-%d %H:%M:%S')} "
+              f": {' '.join(cmd)} =====\n")
+    with open(log, "ab", buffering=0) as fh:
+        fh.write(banner.encode())
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(hrepo),
+            stdin=subprocess.DEVNULL,
+            stdout=fh,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,   # setsid → its own process group
+            env={**os.environ, "PYTHONUNBUFFERED": "1"},
+        )
+
+    # --- wait until it serves ---
+    deadline = time.time() + args.timeout
+    healthy = False
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            break
+        if _http_ok(port):
+            healthy = True
+            break
+        time.sleep(0.5)
+
+    if proc.poll() is not None:
+        bad(f"wdnwebui exited during the startup (exit code {proc.returncode})")
+        _print_log_tail(log, 25)
+        return 1
+
+    if not healthy:
+        if _port_holder(port):
+            warn(f"the port is bound, but /health did not answer within "
+                 f"{args.timeout:.0f}s — the app is probably still booting")
+        else:
+            bad(f"wdnwebui did not come up within {args.timeout:.0f}s")
+            _print_log_tail(log, 25)
+            return 1
+
+    # --- record the pid ---
+    _service_dir().mkdir(parents=True, exist_ok=True)
+    _pid_file().write_text(json.dumps({
+        "pid": proc.pid,
+        "port": port,
+        "started": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "log": str(log),
+        "cmd": " ".join(cmd),
+    }, indent=2) + "\n")
+
+    ok(f"wdnwebui started (pid {proc.pid})")
+    _print_service_urls(port)
+    note(f"the log   {log}")
+    note("stop it with:  wdn stop")
+    return 0
+
+
+def cmd_stop(args: argparse.Namespace) -> int:
+    step("stopping wdnwebui")
+
+    # (pid, label, exclusive_group, port_hint)
+    targets: list[tuple[int, str, bool, int | None]] = []
+    state = _read_pid_file()
+    if state:
+        pid = int(state.get("pid") or 0)
+        if pid and _pid_alive(pid):
+            # we started it → it has a session of its own → the whole
+            # process group belongs to the service
+            raw = state.get("port")
+            port = int(raw) if raw else None
+            targets.append((pid, f"wdnwebui (port {port or '?'})", True, port))
+        # the pid file goes either way — a stale one is worse than none
+        _pid_file().unlink(missing_ok=True)
+
+    if not targets:
+        # not started by `wdn start` — look for a webui of this repo.
+        # Its process group may contain somebody else's shell, so only
+        # the process and its descendants are signalled. The port is
+        # unknown here → it is resolved from the process itself.
+        for pid, _cmd in _service_processes():
+            targets.append((pid, "wdnwebui", False, None))
+
+    if not targets:
+        ok("wdnwebui is not running")
+        return 0
+
+    # systemd owns it — don't fight the manager behind its back
+    for pid, _label, _excl, _port in targets:
+        unit = _systemd_unit(pid)
+        if unit:
+            warn(f"wdnwebui is managed by systemd ({unit})")
+            note(f"stop it with:  sudo systemctl stop {unit}")
+            return 1
+
+    for pid, label, exclusive, port in targets:
+        if port is None:
+            # not started by us → ask the process which port it serves
+            ports = _ports_of_pid(pid)
+            port = ports[0] if ports else None
+        if _terminate_group(pid, port, exclusive_group=exclusive):
+            ok(f"stopped {label} (pid {pid})")
+            if port:
+                ok(f"port {port} is free")
+        else:
+            bad(f"could not stop {label} (pid {pid}) — kill it manually")
+            if port:
+                holder = _port_holder(port)
+                bad(f"port {port} is still held by pid {holder}"
+                    if holder else f"port {port} is still held")
+
+    workers = _orphan_workers()
+    if workers:
+        note(f"{len(workers)} compute_worker process(es) are still alive "
+             f"(they are adopted by the next boot — that is by design)")
     return 0
 
 
@@ -1888,6 +2466,20 @@ def build_parser() -> argparse.ArgumentParser:
 
     vn = sub.add_parser("version", help="print the version")
     vn.set_defaults(func=cmd_version)
+
+    stt = sub.add_parser(
+        "start",
+        help="start the wdnwebui service in the background and listen on the given port",
+    )
+    stt.add_argument("port", nargs="?", type=int, default=DEFAULT_PORT,
+                     help=f"the TCP port to listen on (default: {DEFAULT_PORT})")
+    stt.add_argument("--timeout", type=float, default=60.0,
+                     help="how long to wait for the service to answer on /health "
+                          "(default: 60s)")
+    stt.set_defaults(func=cmd_start)
+
+    spt = sub.add_parser("stop", help="stop the wdnwebui service")
+    spt.set_defaults(func=cmd_stop)
 
     return p
 

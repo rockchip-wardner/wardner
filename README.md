@@ -91,8 +91,14 @@ dependencies and builds the native libraries.
 Start it:
 
 ```bash
+wdn start 8000                   # in the background → http://<board-ip>:8000/
+```
+
+Or in the foreground, to watch the logs:
+
+```bash
 cd ~/.wardner/wdnwebui
-.venv/bin/python run.py        # http://<board-ip>:8000/
+.venv/bin/python run.py
 ```
 
 Update:
@@ -152,8 +158,44 @@ use it directly:
 ```bash
 wdn update      # update every downloaded repo to the latest on the source site, and re-sync the venv
 wdn status      # show each repo's commit / remote and the venv status
+wdn start 8080  # start the wdnwebui service in the background, listening on port 8080
+wdn stop        # stop the wdnwebui service
 wdn version     # version number
 ```
+
+### `wdn start` / `wdn stop` — run the web service
+
+```bash
+wdn start 8080     # listen on 8080 (the port is optional — the default is 8000)
+wdn stop           # stop it again
+```
+
+`wdn start` runs the service **in the background** — the command returns as soon as the
+web UI answers on `/health`, and prints the URL to open:
+
+```
+▶ starting wdnwebui on port 8080
+  ● wdnwebui started (pid 559670)
+  ● the web UI is listening on http://192.168.169.215:8080/
+```
+
+| | |
+|---|---|
+| the pid file | `~/.wardner/run/wdnwebui.pid` |
+| the log | `~/.wardner/logs/wdnwebui.log` |
+
+The service runs in **its own session** — it survives the terminal it was started from,
+and `wdn stop` signals the whole process group, so the uvicorn reloader *and* its
+worker go down together. `wdn stop` waits until the port is really free before it
+returns, so a `wdn stop` + `wdn start` cycle never hits `[Errno 98] Address already in use`.
+
+No root and no systemd are needed — the pid file plus the process group behave the same
+on every install. If the service is managed by **systemd** (the autostart unit of
+`wdnwebui/install_autostart.sh`), `wdn stop` says so and points at `systemctl stop`
+instead of fighting the service manager behind its back.
+
+The `compute_worker` processes are spawned with their own session on purpose — they
+survive the stop and are adopted again by the next boot (over DDS).
 
 ### `wdn update` does three things
 
@@ -188,8 +230,10 @@ verifies that the four packages `wdnav` / `wdnai` / `wdndds` / `wdnhid` really i
 If the service is still running the old code, restart it after the update:
 
 ```bash
-cd ~/.wardner/wdnwebui && .venv/bin/python run.py
+wdn stop && wdn start 8080
 ```
+
+(Or run it in the foreground for the logs — `cd ~/.wardner/wdnwebui && .venv/bin/python run.py`.)
 
 > After the install, the **current** terminal has not picked the PATH up yet — open
 > a new terminal, or `source ~/.bashrc` (zsh: `source ~/.zshrc`). A board that
@@ -327,7 +371,7 @@ adding a package needs no change to the installer.
 points at boot, so restart the service after installing:
 
 ```bash
-cd ~/.wardner/wdnwebui && .venv/bin/python run.py
+wdn stop && wdn start 8000
 ```
 
 **The compute page says "功能未启用".** That means the `.so` of `wdndds` was not built.
