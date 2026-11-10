@@ -142,7 +142,13 @@ pkg_base_for() {
 detect_source_url() {
     local p cmd url
     for p in /proc/[0-9]*; do
-        cmd="$(tr '\0' ' ' < "$p/cmdline" 2>/dev/null)" || continue
+        # ⚠️ `2>/dev/null` 必须写在输入重定向**之前**，顺序不能反 —— bash 从左到右
+        # 执行重定向，进程刚好退出时 shell 自己报的重定向错误也会被吞掉。
+        # 写成 `< file 2>/dev/null`（反过来）会漏出 "No such file or directory"
+        # 噪音（扫几百个 pid 必撞 TOCTOU）。
+        #
+        # 与 install.sh 的 bootstrap 段是**同一套逻辑** —— 改一处必须改另一处。
+        cmd="$(tr '\0' ' ' 2>/dev/null < "$p/cmdline")" || continue
         case "$cmd" in
             *curl*install.sh*) ;;
             *) continue ;;

@@ -79,7 +79,14 @@ if [ -z "${WARDNER_BOOTSTRAPPED:-}" ]; then
     [ -n "$_src" ] && _explicit=1
     if [ -z "$_src" ]; then
         for _p in /proc/[0-9]*; do
-            _cmd="$(tr '\0' ' ' < "$_p/cmdline" 2>/dev/null)" || continue
+            # ⚠️ `2>/dev/null` 必须写在输入重定向**之前**，顺序不能反。
+            #
+            # bash 按**从左到右**执行重定向：先把 stderr 换成 /dev/null，之后输入
+            # 重定向失败时 shell **自己**报的那句 "No such file or directory" 也
+            # 一并被吞掉。写成 `< file 2>/dev/null`（反过来）就漏出这行噪音 ——
+            # 扫几百个 pid，总有刚退出的（TOCTOU：glob 展开后进程就死了，
+            # /proc/<pid> 被内核摘掉），用户会以为安装出错了。
+            _cmd="$(tr '\0' ' ' 2>/dev/null < "$_p/cmdline")" || continue
             case "$_cmd" in *curl*install.sh*) ;; *) continue ;; esac
             _u="$(printf '%s\n' "$_cmd" | grep -oE 'https?://[^ ]+' | head -1)"
             [ -n "$_u" ] && { _src="$_u"; break; }
