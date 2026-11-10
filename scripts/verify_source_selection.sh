@@ -192,22 +192,33 @@ sec "6. 三仓同源"
 if [ "$CHECK_NET" -eq 0 ]; then
     printf '  （--no-net，跳过）\n'
 else
-    same=1
-    for f in install.sh install_github.sh install_gitee.sh; do
-        gh="https://github.com/rockchip-wardner/wardner/raw/master/$f"
-        gt="https://gitee.com/rockchip-wardner/wardner/raw/master/$f"
-        curl -fsSL --max-time 30 "$gh" -o "$TMP/gh-$f" 2>/dev/null || { bad "拉取 GitHub 的 $f 失败"; same=0; continue; }
-        curl -fsSL --max-time 30 "$gt" -o "$TMP/gt-$f" 2>/dev/null || { bad "拉取 Gitee 的 $f 失败"; same=0; continue; }
-        if cmp -s "$TMP/gh-$f" "$TMP/gt-$f"; then
-            ok "$f 两个站的内容一致"
-        else
-            bad "$f 两个站的内容**不一致** —— Gitee 的镜像还没同步"
-            diff "$TMP/gh-$f" "$TMP/gt-$f" | head -10 | sed 's/^/      /'
-            same=0
+    # 取 GitHub 侧的文件。raw.githubusercontent.com 在国内常常不通，
+    # 所以先试 raw，失败就退回 git clone（git 协议走 ssh/https 一般还通）。
+    GH_DIR="$TMP/gh"
+    rm -rf "$GH_DIR"
+    if ! timeout 60 git clone --depth 1 --quiet \
+            https://github.com/rockchip-wardner/wardner.git "$GH_DIR" 2>/dev/null; then
+        if ! timeout 60 git clone --depth 1 --quiet \
+                git@github.com:rockchip-wardner/wardner.git "$GH_DIR" 2>/dev/null; then
+            bad "拉不到 GitHub 侧的仓 —— 本机到 GitHub 不通，同源检查做不了"
+            GH_DIR=""
         fi
-    done
-    if [ "$same" -eq 1 ]; then
-        ok "三仓同源"
+    fi
+
+    if [ -n "$GH_DIR" ]; then
+        for f in install.sh install_github.sh install_gitee.sh; do
+            gt="https://gitee.com/rockchip-wardner/wardner/raw/master/$f"
+            if ! timeout 40 curl -fsSL --max-time 35 "$gt" -o "$TMP/gt-$f" 2>/dev/null; then
+                bad "拉取 Gitee 的 $f 失败"
+                continue
+            fi
+            if cmp -s "$GH_DIR/$f" "$TMP/gt-$f"; then
+                ok "$f 两个站的内容一致"
+            else
+                bad "$f 两个站的内容**不一致** —— Gitee 的镜像还没同步"
+                diff "$GH_DIR/$f" "$TMP/gt-$f" | head -10 | sed 's/^/      /'
+            fi
+        done
     fi
 fi
 
