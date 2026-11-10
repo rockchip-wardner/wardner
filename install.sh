@@ -1,13 +1,20 @@
 #!/usr/bin/env bash
 # wdnwebui 一键安装器
 #
+#   ── GitHub（默认）────────────────────────────────────────────
 #   curl -fsSL https://github.com/rockchip-wardner/wardner/raw/master/install.sh | bash
 #
-# 等价的写法（同一个文件）：
-#   curl -fsSL https://raw.githubusercontent.com/rockchip-wardner/wardner/master/install.sh | bash
+#   ── Gitee 国内镜像（国内网络更快）────────────────────────────
+#   curl -fsSL https://gitee.com/rockchip-wardner/wardner/raw/master/install.sh | bash
 #
-# ⚠️ 注意是 **/raw/master/**，不能写成 .../wardner/install.sh —— 后者是 GitHub
-#    的网页路由，不是原始文件地址（curl 会拿到 404 或一段 HTML）。
+# ⚠️ 注意是 **/raw/master/**，不能写成 .../wardner/install.sh —— 那是网页路由，
+#    不是原始文件地址（curl 会拿到 404 或一段 HTML）。
+#
+# 安装器**从你用的那个 URL 推断源站**：从 Gitee 装的，宿主应用和 8 个 SDK /
+# 插件包、以及后续的 `wdn update` 也都走 Gitee。
+#
+# ⚠️ Gitee 是**只读镜像**（内容由上游自动同步）—— 从它拉没问题，**不要往它推**。
+#    需要推送请用 GitHub（或内网主仓库）。
 #
 # 装到 ~/.wardner 下：
 #
@@ -56,7 +63,7 @@ if [ -z "${WARDNER_BOOTSTRAPPED:-}" ]; then
     # ── 推断「脚本是从哪儿取来的」──────────────────────────────────────
     #
     # 硬编码 org/repo 意味着换组织 / 换 fork 就得改代码。这里反过来：从
-    # 来源 URL 反推组织和仓库名 —— 安装器因此是**自描述**的。
+    # 来源 URL 反推**源站** + 组织 + 仓库名 —— 安装器因此是**自描述**的。
     #
     # 来源优先级：
     #   1. WARDNER_REPO_URL 环境变量（显式覆盖）
@@ -65,8 +72,11 @@ if [ -z "${WARDNER_BOOTSTRAPPED:-}" ]; then
     #   3. 内置兜底
     #
     # ⚠️ 这段在 source lib/*.sh **之前**跑（那时还不知道脚本目录），
-    #    所以 url 解析逻辑在这里内联了一份 —— lib/urls.sh 是同套逻辑的副本。
+    #    所以 url 解析逻辑在这里内联了一份 —— lib/urls.sh 是同套逻辑的副本，
+    #    **改一处必须改另一处**。
     _src="${WARDNER_REPO_URL:-}"
+    _explicit=0
+    [ -n "$_src" ] && _explicit=1
     if [ -z "$_src" ]; then
         for _p in /proc/[0-9]*; do
             _cmd="$(tr '\0' ' ' < "$_p/cmdline" 2>/dev/null)" || continue
@@ -77,23 +87,69 @@ if [ -z "${WARDNER_BOOTSTRAPPED:-}" ]; then
     fi
     [ -z "$_src" ] && _src="https://github.com/rockchip-wardner/wardner/raw/master/install.sh"
 
-    _rest="${_src%%\?*}"
-    _rest="${_rest%/}"
-    case "$_rest" in
-        *raw.githubusercontent.com/*) _rest="${_rest#*raw.githubusercontent.com/}" ;;
-        *github.com/*)               _rest="${_rest#*github.com/}" ;;
+    # 解析来源 URL → "<host> <org> <repo>"。
+    #
+    # 规律：**路径的前两段永远是 org / repo**，后面的（raw / blob / 分支 / 文件）
+    # 一律丢掉 —— 于是 GitHub 的 /raw/ 与 Gitee 的 /raw/ 用同一套解析。
+    _u="${_src%%\?*}"
+    _u="${_u%/}"
+    _u="${_u%.git}"
+    _host=""; _path=""
+    case "$_u" in
+        git@*:*)
+            _host="${_u#git@}"; _host="${_host%%:*}"
+            _path="${_u#git@*:}"
+            ;;
+        ssh://*/*)
+            _host="${_u#ssh://}"; _host="${_host%%/*}"; _host="${_host##*@}"
+            _path="${_u#ssh://*/}"
+            ;;
+        http://*/*|https://*/*)
+            _host="${_u#*://}"; _host="${_host%%/*}"
+            _path="${_u#*://*/}"
+            ;;
     esac
-    _rest="${_rest%.git}"
-    _org="${_rest%%/*}"
-    _rest="${_rest#*/}"
-    _repo="${_rest%%/*}"
-    if [ -z "$_org" ] || [ -z "$_repo" ]; then
-        _org="rockchip-wardner"; _repo="wardner"
+    # raw.githubusercontent.com 是**取文件**的域名，不是 clone 的域名
+    case "$_host" in
+        raw.githubusercontent.com) _host="github.com" ;;
+    esac
+    _org=""; _repo=""
+    case "$_path" in
+        */*)
+            _org="${_path%%/*}"
+            _path="${_path#*/}"
+            _repo="${_path%%/*}"
+            ;;
+    esac
+    if [ -z "$_host" ] || [ -z "$_org" ] || [ -z "$_repo" ]; then
+        _host="github.com"; _org="rockchip-wardner"; _repo="wardner"
     fi
+
+    WARDNER_SOURCE_HOST="$_host"
+    # 协议由**源站**决定：GitHub / Gitee 走 https（公开仓，匿名 clone），
+    # 内网走 ssh（内网 GitLab 的 web 口在 8080，那是 HTTP 端口，取码用 ssh）。
+    #
+    # ⚠️ 这条规则在 lib/urls.sh::source_scheme_for_host 里也有一份 —— bootstrap
+    #    阶段还没 source lib/，只能内联。改一处必须改另一处。
+    case "$_host" in
+        github.com|gitee.com) _scheme="https" ;;
+        *)                     _scheme="ssh" ;;
+    esac
+    WARDNER_SOURCE_SCHEME="$_scheme"
     WARDNER_ORG="$_org"
     WARDNER_REPO_NAME="$_repo"
-    export WARDNER_ORG WARDNER_REPO_NAME
-    WARDNER_REPO_URL="https://github.com/$WARDNER_ORG/$WARDNER_REPO_NAME.git"
+    export WARDNER_SOURCE_HOST WARDNER_SOURCE_SCHEME WARDNER_ORG WARDNER_REPO_NAME
+
+    # 用户显式给了 clone 地址就**原样用** —— 里面可能有 port、SSH 形式、
+    # 内网 GitLab 的路径前缀，推测出来的地址未必等价。
+    if [ "$_explicit" -eq 1 ]; then
+        WARDNER_REPO_URL="$_src"
+    else
+        case "$_scheme" in
+            ssh) WARDNER_REPO_URL="git@${_host%%:*}:$_org/$_repo.git" ;;
+            *)   WARDNER_REPO_URL="https://$_host/$_org/$_repo.git" ;;
+        esac
+    fi
     _repo_dir="$WARDNER_HOME/$WARDNER_REPO_NAME"
 
     mkdir -p "$WARDNER_HOME"
@@ -137,10 +193,12 @@ fi
 
 # --- 到这里才拿得到真实路径 ---
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=lib/common.sh
-. "$SCRIPT_DIR/lib/common.sh"
+# ⚠️ 顺序不能反：common.sh 要用 urls.sh 的 source_scheme_for_host 推导
+#    源站协议（GitHub / Gitee → https，内网 → ssh）。
 # shellcheck source=lib/urls.sh
 . "$SCRIPT_DIR/lib/urls.sh"
+# shellcheck source=lib/common.sh
+. "$SCRIPT_DIR/lib/common.sh"
 
 # ---------------------------------------------------------------------------
 # Phase 1: 前置检查
@@ -180,23 +238,39 @@ preflight() {
 # 某个 fork 拉的，那 fork 的 remote 就是权威的。
 # ---------------------------------------------------------------------------
 resolve_source() {
-    local remote org repo
+    local remote host org repo scheme
     remote="$(git -C "$WARDNER_REPO_DIR" remote get-url origin 2>/dev/null || true)"
     [ -n "$remote" ] || return 0
 
-    read -r org repo < <(parse_github_url "$remote") || return 0
-    [ -n "${org:-}" ] && [ -n "${repo:-}" ] || return 0
+    read -r host org repo < <(parse_repo_url "$remote") || return 0
+    [ -n "${host:-}" ] && [ -n "${org:-}" ] && [ -n "${repo:-}" ] || return 0
 
     if [ "$org" != "$WARDNER_ORG" ]; then
         log "源组织： $WARDNER_ORG → $org（以 clone 的 remote 为准）"
     fi
+    if [ "$host" != "$WARDNER_SOURCE_HOST" ]; then
+        log "源站： $WARDNER_SOURCE_HOST → $host（以 clone 的 remote 为准）"
+    fi
+
+    scheme="$(source_scheme_for_host "$host")"
+    WARDNER_SOURCE_HOST="$host"
+    WARDNER_SOURCE_SCHEME="$scheme"
     WARDNER_ORG="$org"
     WARDNER_REPO_NAME="$repo"
     WARDNER_REPO_DIR="$WARDNER_HOME/$WARDNER_REPO_NAME"
-    WARDNER_REPO_URL="$(github_clone_url "$org" "$repo")"
-    WARDNER_PKG_BASE="git+https://github.com/$org"
-    export WARDNER_ORG WARDNER_REPO_NAME WARDNER_REPO_URL WARDNER_PKG_BASE
-    ok "源： github.com/$org/$repo"
+    WARDNER_REPO_URL="$(repo_clone_url_for "$scheme" "$host" "$org" "$repo")"
+    # 用户在环境变量里显式指定了包来源（内网镜像等）→ 不覆盖它。
+    # 覆盖了就等于把用户特意指定的源静默改掉 —— 那正是 README 里写明的用法。
+    if [ -z "$WARDNER_PKG_BASE_ENV" ]; then
+        WARDNER_PKG_BASE="$(pkg_base_for "$scheme" "$host" "$org")"
+    fi
+    export WARDNER_SOURCE_HOST WARDNER_SOURCE_SCHEME WARDNER_ORG WARDNER_REPO_NAME WARDNER_REPO_URL WARDNER_PKG_BASE
+    ok "源： $host/$org/$repo"
+
+    if wardner_host_is_readonly "$host"; then
+        note "$(wardner_host_label "$host") 是只读镜像（内容由上游自动同步）—— 从它拉没问题，"
+        note "但**不要往它推**。要推送请把 remote 指回 GitHub 或内网主仓库。"
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -320,8 +394,8 @@ install_packages() {
         note "首次安装 —— 强制重建全部包"
     fi
 
-    # WARDNER_PKG_BASE：让 update_rkwhl.sh 的「目录不存在」兜底路径也走公网，
-    # 而不是默认的内网镜像（现场板子没外网时才需要内网）。
+    # WARDNER_PKG_BASE：让 update_rkwhl.sh 的「目录不存在」兜底路径也走**源站**
+    # （GitHub 或 Gitee），而不是默认的内网镜像。
     if ! (
         cd "$WARDNER_HOST_DIR" || exit 1
         WARDNER_PKG_BASE="$WARDNER_PKG_BASE" \
@@ -332,7 +406,7 @@ install_packages() {
         # 汇总「以下包未更新」并 exit 1。首次安装时这意味着**有包没装上**。
         echo "" >&2
         die "安装未完成 —— 见上方「以下包未更新」的汇总。
-     首次安装失败最常见的是网络：clone / pip 拉 GitHub 抖了一下。
+     首次安装失败最常见的是网络：clone / pip 拉 $WARDNER_SOURCE_HOST 抖了一下。
      直接重跑本脚本即可（已装好的包会跳过）："
     fi
 
@@ -444,11 +518,20 @@ install_wdn_command() {
 }
 
 report() {
+    local src_label; src_label="$(wardner_host_label "$WARDNER_SOURCE_HOST")"
+    local src_line="  源站         $WARDNER_SOURCE_HOST（$src_label）"
+
+    if wardner_host_is_readonly "$WARDNER_SOURCE_HOST"; then
+        src_line="$src_line
+  ※ 只读镜像 —— 内容由上游自动同步，**不要往它推代码**；推送请用 GitHub / 内网主仓库"
+    fi
+
     cat >&2 <<EOF
 
 $(printf '%s' "$C_GRN")安装完成。$(printf '%s' "$C_RST")
 
   安装根目录   $WARDNER_HOME
+$src_line
   宿主应用     $WARDNER_HOST_DIR
   虚拟环境     $WARDNER_VENV
   SDK / 插件   $WARDNER_VENV_SRC
@@ -460,7 +543,7 @@ $(printf '%s' "$C_GRN")安装完成。$(printf '%s' "$C_RST")
 
 wdn 命令（已装进 PATH）：
 
-  wdn update                       # 把所有仓更新到 GitHub 最新并重新同步 venv
+  wdn update                       # 把所有仓更新到 $src_label 最新并重新同步 venv
   wdn status                       # 看各仓的 commit / remote 和 venv 状态
 
   ※ 当前终端还没生效 —— 新开一个终端，或执行： source ~/.bashrc

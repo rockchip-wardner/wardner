@@ -1,43 +1,73 @@
-# wdnwebui 一键安装器
+[English](README.md) | [简体中文](README_CN.md)
+# wdnwebui One-Click Installer
 
-Rockchip 平台 Web 服务（[wdnwebui](https://github.com/rockchip-wardner/wdnwebui)）
-及其 SDK / 卡片插件的一键安装脚本。
-
-```bash
-curl -fsSL https://github.com/rockchip-wardner/wardner/raw/master/install.sh | bash
-```
-
-等价的写法（同一个文件）：
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/rockchip-wardner/wardner/master/install.sh | bash
-```
-
-> 注意路径是 **`/raw/master/`**。写成 `.../wardner/install.sh` 拿到的是 GitHub 的
-> 网页路由，不是原始文件 —— curl 会 404，或者把一段 HTML 喂给 bash。
-
-一条命令把整套装到 `~/.wardner`，建好 venv、装好依赖、编好原生库。
+One-click install scripts for the Rockchip platform web service
+([wdnwebui](https://github.com/rockchip-wardner/wdnwebui)) and its SDKs / card
+plugins.
 
 ---
 
-## 装完是什么样
+## Two install sources
+
+| Source | One-click command | When to use it |
+|---|---|---|
+| **GitHub** | `curl -fsSL https://github.com/rockchip-wardner/wardner/raw/master/install.sh \| bash` | Default; international networks |
+| **Gitee domestic mirror** | `curl -fsSL https://gitee.com/rockchip-wardner/wardner/raw/master/install.sh \| bash` | Faster on domestic networks |
+
+> ⚠️ The path is **`/raw/master/`**. Writing `.../wardner/install.sh` gives you a web
+> page, not the raw file — curl will 404, or feed a chunk of HTML to bash.
+
+### The source is decided by the URL you used
+
+The installer **hard-codes neither the organization nor the source site** — it works
+backwards from "which URL did it come from":
+
+```
+curl's URL ──▶ hostname ──▶ source site ──▶ transport scheme ──▶ clone URL for 9 repos
+```
+
+* **GitHub / Gitee go over https** — public repos, an anonymous clone is enough: no
+  account, no SSH key, so users who never logged in can install;
+* **The intranet goes over ssh** — the intranet GitLab's web port is 8080 (that is the
+  HTTP port); fetching the code over ssh is how an intranet should work.
+
+So **if you install from Gitee, the host app, the 8 SDK / plugin packages and every
+later `wdn update` all go through Gitee**; if you install from GitHub, they all go
+through GitHub. Nothing to configure.
+
+> ⚠️ **Gitee is a read-only mirror — its content is synced from upstream automatically,
+> do not push code to it.**
+> Commits pushed there are overwritten by the next sync, with no warning at all. To
+> push, use **GitHub** (or the intranet main repo).
+>
+> Under a Gitee source, `wdn update` points each repo's **pushurl back to GitHub** —
+> fetching goes through the mirror (fast), pushing goes to GitHub (writable). It only
+> sets that for you when you have not customized a pushurl yourself; if you have, it
+> does not touch a single character.
+
+One command installs the whole set into `~/.wardner`, creates the venv, installs the
+dependencies and builds the native libraries.
+
+---
+
+## What you get after install
 
 ```
 ~/.wardner/
-├── wardner/                    本仓（安装器自身）
+├── wardner/                    this repo (the installer itself)
 │   ├── install.sh
 │   ├── update.sh
-│   ├── bin/wdn                 wdn 命令入口（bash 启动器）
-│   └── cli/wdn.py              wdn 的真正实现（用 .venv 的 python 跑）
-└── wdnwebui/                   宿主应用（FastAPI 服务 + 卡片宿主）
+│   ├── bin/wdn                 wdn command entry point (bash launcher)
+│   └── cli/wdn.py              the real implementation of wdn (runs with .venv's python)
+└── wdnwebui/                   host app (FastAPI service + card host)
     ├── app/  run.py  ...
     ├── requirements.txt
-    └── .venv/                  虚拟环境
+    └── .venv/                  virtual environment
         ├── bin/python
-        └── src/                SDK / 卡片插件包（各自独立 git 仓）
-            ├── wdnav/          MPP / RGA2 / V4L2 视频
+        └── src/                SDK / card plugin packages (each its own git repo)
+            ├── wdnav/          MPP / RGA2 / V4L2 video
             ├── wdnai/          RKNN LLM / VLM / TTS
-            ├── wdndds/         DDS / RPC（模型隔离）
+            ├── wdndds/         DDS / RPC (model isolation)
             ├── wdnhid/         USB Gadget HID
             ├── wdnapps_video_analyzer/
             ├── wdnapps_hdmi_processor/
@@ -45,20 +75,20 @@ curl -fsSL https://raw.githubusercontent.com/rockchip-wardner/wardner/master/ins
             └── wdnapps_media_generator/
 ```
 
-启动：
+Start it:
 
 ```bash
 cd ~/.wardner/wdnwebui
-.venv/bin/python run.py        # http://<板子IP>:8000/
+.venv/bin/python run.py        # http://<board-ip>:8000/
 ```
 
-更新：
+Update:
 
 ```bash
-wdn update                     # 推荐：更新所有仓 + 重新同步 venv
+wdn update                     # recommended: update every repo + re-sync the venv
 ```
 
-也可以用脚本：
+You can also use the script:
 
 ```bash
 ~/.wardner/wardner/update.sh
@@ -66,82 +96,98 @@ wdn update                     # 推荐：更新所有仓 + 重新同步 venv
 
 ---
 
-## 它到底做了什么
+## What it actually does
 
-| 步骤 | 说明 |
+| Step | What it does |
 |---|---|
-| 前置检查 | `git` / `python3`（≥ 3.9）/ `venv` 模块齐不齐 |
-| 拉宿主 | clone [wdnwebui](https://github.com/rockchip-wardner/wdnwebui) → `~/.wardner/wdnwebui` |
-| 建 venv | `~/.wardner/wdnwebui/.venv` |
-| 拉包 | clone 8 个 SDK / 插件仓 → `.venv/src/<pkg>/` |
-| 编译依赖 | cmake / build-essential / patchelf / libfoonathan-memory-dev（缺了会提示补装命令） |
-| 安装校验 | 交给宿主仓的 `update_rkwhl.sh`（见下） |
-| 冒烟 | `import wdnav/wdnai/wdndds/wdnhid` + 断言两个 `.so` 落地 |
-| 装 wdn | 命令挂进 PATH，并把环境写进 `~/.bashrc`（见下） |
+| Preflight checks | whether `git` / `python3` (≥ 3.9) / the `venv` module are all present |
+| Fetch the host app | clone [wdnwebui](https://github.com/rockchip-wardner/wdnwebui) → `~/.wardner/wdnwebui` (**follows the source site**) |
+| Create the venv | `~/.wardner/wdnwebui/.venv` |
+| Fetch the packages | clone the 8 SDK / plugin repos → `.venv/src/<pkg>/` (**follows the source site**) |
+| Build the dependencies | cmake / build-essential / patchelf / libfoonathan-memory-dev (if missing, it prints the install command) |
+| Install and verify | delegated to the host repo's `update_rkwhl.sh` (see below) |
+| Smoke test | `import wdnav/wdnai/wdndds/wdnhid` + assert that both `.so` files landed |
+| Install wdn | put the command on PATH and write the environment into `~/.bashrc` (see below) |
 
-**安装与校验没有在本仓重写** —— 直接调用宿主仓里的
-[`update_rkwhl.sh`](https://github.com/rockchip-wardner/wdnwebui/blob/master/update_rkwhl.sh)。
-那 470 行是在板子上打磨出来的，装的是它已经在做的事：
+**Install and verification are not reimplemented here** — the installer calls
+[`update_rkwhl.sh`](https://github.com/rockchip-wardner/wdnwebui/blob/master/update_rkwhl.sh)
+in the host repo directly. Those 470 lines were honed on real boards, and they install
+what it already knows how to install:
 
-- 装 `requirements.txt`（web 侧依赖）
-- 修补 PyPI 上 `v4l2`（2014 年 py2 时代 sdist）的 py3 兼容问题
-- 逐包 `git pull` + editable 重装（HEAD 没变就跳过）
-- **断言 `wdndds` / `wdnav` 的 `.so` 真的落地了** —— setuptools ≥64 会静默吞掉
-  build hook 的 RuntimeError，pip 照样返回 0、满屏绿色，但产物根本没生成
-- **校验 4 个插件包的卡片真的注册上了** —— entry point 名 ↔ manifest `"id"` ↔
-  `static/` 三段链路；不一致时 pip 全程报成功，宿主启动却把这几张卡 FATAL 跳过
-- **审计各 SDK 自己声明的依赖** —— SDK 是 `--no-deps` 装的，声明的依赖不会自己
-  进 venv，而故障现场离原因很远（缺 v4l2 → HDMI-IN 端点 503；缺 tokenizers →
-  算力页「模型启动失败」）
+- install `requirements.txt` (the web-side dependencies)
+- patch the PyPI `v4l2` package (a 2014 py2-era sdist) for py3 compatibility
+- per package, `git pull` + reinstall editable (skipped when HEAD has not changed)
+- **assert that the `.so` files of `wdndds` / `wdnav` really landed** — setuptools ≥64
+  silently swallows a RuntimeError raised by the build hook, pip still returns 0, the
+  screen is all green, but the artifacts were never produced
+- **verify that the cards of the 4 plugin packages really registered** — the three-part
+  chain entry point name ↔ manifest `"id"` ↔ `static/`; when they disagree pip reports
+  success all the way through, while the host skips those cards as FATAL at startup
+- **audit the dependencies each SDK declares for itself** — SDKs are installed with
+  `--no-deps`, so their declared dependencies never enter the venv on their own, and
+  the failure is far away from the cause (missing v4l2 → the HDMI-IN endpoint 503s;
+  missing tokenizers → "模型启动失败" on the compute page)
 
 ---
 
-## `wdn` 命令
+## The `wdn` command
 
-装完就有 —— PATH 已经写进 `~/.bashrc`，当前用户直接用：
+It exists right after the install — PATH is already written into `~/.bashrc`, the
+current user can use it directly:
 
 ```bash
-wdn update      # 把所有已下载的仓更新到 GitHub 最新，并重新同步 venv
-wdn status      # 看各仓的 commit / remote 和 venv 状态
-wdn version     # 版本号
+wdn update      # update every downloaded repo to the latest on the source site, and re-sync the venv
+wdn status      # show each repo's commit / remote and the venv status
+wdn version     # version number
 ```
 
-### `wdn update` 做三件事
+### `wdn update` does three things
 
-1. **对齐 remote 到 GitHub。** 各仓的 remote 可能指着内网镜像，改回 GitHub。
-   分支跟踪关系只在「当前跟踪的 remote 不指向 GitHub」时才动 —— 跟踪关系
-   同时也是你的推送路径，擅自改会让 `git push` 悄悄改道。想完全不动 remote
-   就加 `--keep-remotes`。
-2. **拉最新代码。** `wardner`（安装器自己）、`wdnwebui`（宿主）、8 个 SDK /
-   插件包，全部快进到 GitHub 的最新。
-3. **重新同步 venv。** 交给宿主仓的 `update_rkwhl.sh`：HEAD 变了就卸载重装，
-   并重编 `wdndds` / `wdnav` 的 `.so`、复核卡片注册、审计依赖。
+1. **Align the remotes with the source site.** A repo's remote may point elsewhere (an
+   intranet mirror / another site); point it back at the **source site** — which source
+   site that is, is decided by this repo's own remote: wherever you installed from is
+   where you keep going. The branch tracking relationship is only touched when "the
+   currently tracked remote does not point at the source site" — that relationship is
+   also your push path, and changing it behind your back silently reroutes `git push`.
+   To leave the remotes completely alone, add `--keep-remotes`.
+   A remote named **`github`** is left alone — it is the push-only publishing mirror,
+   and rewriting its URL would silently turn `git push github` into a push back to the
+   source site, so the release would never happen and nothing would say so.
+2. **Pull the latest code.** `wardner` (the installer itself), `wdnwebui` (the host
+   app) and the 8 SDK / plugin packages all fast-forward to the latest on the source
+   site.
+3. **Re-sync the venv.** Delegated to the host repo's `update_rkwhl.sh`: when HEAD has
+   changed it uninstalls and reinstalls, rebuilds the `.so` files of `wdndds` / `wdnav`,
+   re-checks card registration and audits the dependencies.
 
-> ⚠️ **顺序不能反。** 8 个 SDK 包的「pull + 判断要不要重装」必须由
-> `update_rkwhl.sh` 自己来做 —— 它靠 **pull 前后的 HEAD 对比**判断要不要
-> 重装。如果 `wdn` 先把代码拉到最新，`update_rkwhl.sh` 就会看到「HEAD 没变」
-> 而跳过重装，`.so` 不会重新编（源码是新的、`.so` 还是旧的）。
+> ⚠️ **The order must not be reversed.** The "pull + decide whether to reinstall" step
+> for the 8 SDK packages must be done by `update_rkwhl.sh` itself — it decides whether
+> to reinstall by **comparing HEAD before and after the pull**. If `wdn` pulls the code
+> first, `update_rkwhl.sh` sees "HEAD has not changed" and skips the reinstall, so the
+> `.so` files are not rebuilt (the sources are new, the `.so` files are still the old
+> ones).
 
-`wdn` 用的是 **venv 里的 python**（`~/.wardner/wdnwebui/.venv/bin/python`），
-所以它能直接 import SDK 做健康检查 —— 更新完会自动验证 `wdnav` / `wdnai` /
-`wdndds` / `wdnhid` 四个包是不是真能 import。
+`wdn` runs with **the python inside the venv** (`~/.wardner/wdnwebui/.venv/bin/python`),
+so it can import the SDKs directly for a health check — after an update it automatically
+verifies that the four packages `wdnav` / `wdnai` / `wdndds` / `wdnhid` really import.
 
-服务还在跑旧代码的话，更新完重启它：
+If the service is still running the old code, restart it after the update:
 
 ```bash
 cd ~/.wardner/wdnwebui && .venv/bin/python run.py
 ```
 
-> 改了 `~/.bashrc` 之后，**当前**终端还没生效 —— 新开一个终端，或
-> `source ~/.bashrc`。
+> After changing `~/.bashrc`, the **current** terminal has not picked it up yet — open
+> a new terminal, or `source ~/.bashrc`.
 
 ---
 
-## 安装器不自行提权
+## The installer never elevates privileges
 
-脚本里**没有任何提权命令**。缺系统依赖（比如编译 `wdndds` 的 `.so` 要
-cmake / build-essential / patchelf / foonathan 头文件）时，它只把要执行的
-命令原样打出来，由你自己以 root 身份跑：
+There is **no privilege-escalation command anywhere in the script**. When a system
+dependency is missing (for example cmake / build-essential / patchelf / the foonathan
+headers needed to build the `.so` of `wdndds`), it only prints the commands to run,
+as-is, for you to run yourself as root:
 
 ```
 × 缺编译依赖： cmake build-essential patchelf libfoonathan-memory-dev
@@ -152,129 +198,185 @@ cmake / build-essential / patchelf / foonathan 头文件）时，它只把要执
 ×   bash ~/.wardner/wdnwebui/update_rkwhl.sh
 ```
 
-同理，`wdn` 命令也是装给**跑安装器的那个人**（家目录就是 `$HOME`）。
+Same thing for the `wdn` command: it is installed for **the person who ran the
+installer** (their home directory is `$HOME`).
 
 ---
 
-## 设计上的几个要点
+## A few design notes
 
-**为什么先 clone 再 pip 装。** `update_rkwhl.sh` 在「目录不存在」时会走
-`pip install -e git+https://…`。而 pip 对 VCS 的 editable 安装是把仓库 clone 到
-临时目录再指向它 —— 临时目录装完即删，editable 安装当场就废
-（`import` 报 `ModuleNotFoundError`），**而 pip 全程报成功**。
-所以安装器总是先自己 clone 到 `.venv/src/<pkg>/`，再让 pip 从本地路径装。
+**Why clone first, then pip-install.** `update_rkwhl.sh` falls back to
+`pip install -e git+https://…` when "the directory does not exist". But pip's editable
+install from a VCS clones the repo into a temporary directory and points at it — the
+temporary directory is deleted right after the install, so the editable install is dead
+on arrival (`import` reports `ModuleNotFoundError`), **and pip reports success the
+whole way through**. So the installer always clones into `.venv/src/<pkg>/` itself
+first, then lets pip install from the local path.
 
-**为什么 FastDDS 不用联网编。** wdndds 的 `.so` 是装的时候现场编的，但
-FastDDS 3.6 的官方预编译产物**随仓分发**（`native/lib/`），`native/bin/nodesize_dbg`
-桩也在仓里 —— 板子没有外网也能编出 `.so`。
+**Why FastDDS is not built over the network.** The `.so` of wdndds is built on site
+during installation, but the official prebuilt artifacts of FastDDS 3.6 **ship with the
+repo** (`native/lib/`), and the `native/bin/nodesize_dbg` stub is in the repo too — so
+a board without internet access can still build the `.so`.
 
-**为什么包来源是可配的。** `update_rkwhl.sh` 里 `WARDNER_PKG_BASE` 指向包仓库
-的前缀，本安装器把它设成公网 GitHub（由来源 URL 推断出的组织）。如果你的板子
-在无外网的隔离网络里，用 `WARDNER_PKG_BASE` 指向你自己的镜像：
+**Why the protocol is decided by the source site, not by the URL the script came from.**
+The intranet GitLab's `/raw/` page is http (the web port is 8080), but the code has to
+be fetched over **ssh** — tying the protocol to the URL breaks the intranet install.
+The other way round, GitHub / Gitee are public repos, and an anonymous clone over
+https is the only path that is friendly to "people who are not signed in". The rule is
+one line:
+
+| Source site | Protocol | Clone URL |
+|---|---|---|
+| `github.com` | https | `https://github.com/<org>/<repo>.git` |
+| `gitee.com` | https | `https://gitee.com/<org>/<repo>.git` |
+| Everything else (intranet) | ssh | `git@<host>:<org>/<repo>.git` |
+
+**Why the package source is configurable.** `WARDNER_PKG_BASE` in `update_rkwhl.sh`
+points at the prefix of the package repos; this installer sets it to the **source
+site** by default (the organization inferred from the source URL). If your board sits
+on an isolated network without internet access, point `WARDNER_PKG_BASE` at your own
+mirror:
 
 ```bash
-WARDNER_PKG_BASE=git+ssh://<你的镜像>/<你的路径> \
+WARDNER_PKG_BASE=git+ssh://git@<your-mirror>/<your-path> \
   ~/.wardner/wardner/install.sh
 ```
 
+If you set `WARDNER_PKG_BASE` explicitly, the installer **will not** overwrite it with
+the source site it inferred.
+
 ---
 
-## 源地址是「推断」出来的，不是写死的
+## The source address is inferred, not hard-coded
 
-安装器**不硬编码组织名**。它从「自己是从哪个 URL 拉下来的」反推：
+The installer **hard-codes neither the organization nor the source site**. It works
+backwards from "which URL did it come from":
 
-1. `WARDNER_REPO_URL` / `WARDNER_ORG` 环境变量（显式覆盖）；
-2. `curl` 的命令行 —— `curl ... | bash` 时脚本本身不知道来源，但 curl 通常还在
-   跑，它的 `/proc/<pid>/cmdline` 里带着完整 URL；
-3. 内置兜底。
+1. The `WARDNER_REPO_URL` / `WARDNER_ORG` / `WARDNER_SOURCE_HOST` environment
+   variables (explicit override);
+2. The `curl` command line — with `curl ... | bash` the script itself does not know
+   the source, but curl is usually still running, and its `/proc/<pid>/cmdline` carries
+   the full URL;
+3. The built-in fallback (GitHub).
 
-clone 之后还会用 **remote 里写着的地址**再确认一次（推断归推断，remote 是事实）。
+After the clone it confirms once more with **the address written in the remote** (the
+inference is an inference, the remote is a fact).
 
-所以从 fork 拉同一个脚本，宿主应用和 8 个 SDK / 插件包都会跟着走那个组织。
-想指定别的组织：
+So pulling the same script from a fork makes the host app and the 8 SDK / plugin
+packages follow that organization; pulling it from Gitee sends everything to Gitee. To
+pick another organization or another source site:
 
 ```bash
 WARDNER_ORG=your-org ~/.wardner/wardner/install.sh
 ```
 
-包清单本身（`packages.conf`）就在仓里，跟着仓走 —— 加包不用改安装器。
+The package list itself (`packages.conf`) lives in the repo and travels with it —
+adding a package needs no change to the installer.
 
 ---
 
-## 环境变量
+## Environment variables
 
-| 变量 | 默认 | 说明 |
+| Variable | Default | Meaning |
 |---|---|---|
-| `WARDNER_HOME` | `~/.wardner` | 安装根目录 |
-| `WARDNER_ORG` | 由来源 URL 推断 | GitHub 组织 |
-| `WARDNER_REPO_NAME` | 由来源 URL 推断 | 本仓名 |
-| `WARDNER_REPO_URL` | 由来源 URL 推断 | 本仓地址 |
-| `WARDNER_HOST_REPO` | `wdnwebui` | 宿主应用仓名 |
-| `WARDNER_PKG_BASE` | `git+https://github.com/<推断出的组织>` | SDK / 插件包来源前缀 |
-| `WARDNER_PYTHON` | `python3` | 用哪个 python 建 venv |
-| `WARDNER_BRANCH` | `master` | 拉哪个分支 |
-| `WARDNER_GIT_RETRY` | `5` | clone / pull 重试次数 |
-| `WARDNER_RETRY_DELAY` | `5` | 重试间隔（秒） |
-| `WARDNER_GIT_LOW_SPEED_LIMIT` | `1` | git 低速阈值（字节/秒）—— 低于它就算断 |
-| `WARDNER_GIT_LOW_SPEED_TIME` | `30` | 触发低速中断的秒数（git 默认没有连接超时，TCP 失败要等 135s） |
+| `WARDNER_HOME` | `~/.wardner` | install root |
+| `WARDNER_SOURCE_HOST` | inferred from the source URL | source site host (`github.com` / `gitee.com` / intranet address) |
+| `WARDNER_SOURCE_SCHEME` | decided by the source site | `github.com` / `gitee.com` → `https`; everything else → `ssh` |
+| `WARDNER_ORG` | inferred from the source URL | organization |
+| `WARDNER_REPO_NAME` | inferred from the source URL | name of this repo |
+| `WARDNER_REPO_URL` | inferred from the source URL | URL of this repo |
+| `WARDNER_HOST_REPO` | `wdnwebui` | host app repo name |
+| `WARDNER_PKG_BASE` | `git+https://<source-site>/<org>` | source prefix for the SDK / plugin packages |
+| `WARDNER_PYTHON` | `python3` | which python builds the venv |
+| `WARDNER_BRANCH` | `master` | which branch to pull |
+| `WARDNER_GIT_RETRY` | `5` | clone / pull retry count |
+| `WARDNER_RETRY_DELAY` | `5` | delay between retries (seconds) |
+| `WARDNER_GIT_LOW_SPEED_LIMIT` | `1` | git low-speed threshold (bytes/second) — below it the transfer counts as broken |
+| `WARDNER_GIT_LOW_SPEED_TIME` | `30` | seconds that trigger the low-speed abort (git has no connect timeout by default, a TCP failure waits 135s) |
 
 ---
 
-## 加一个新包
+## Adding a new package
 
-1. 在 GitHub 上建同名仓（组织 `rockchip-wardner`）；
-2. 在 [`packages.conf`](packages.conf) 加一行：`<包名> <仓名>`；
-3. 顺序上 SDK 在前、卡片插件在后 —— 插件会 import SDK。
+1. Create a repo of the same name on the source site (organization `rockchip-wardner`);
+2. Add a line to [`packages.conf`](packages.conf): `<package-name> <repo-name>`;
+3. Keep the SDKs before the card plugins — the plugins import the SDKs.
 
 ---
 
-## 排障
+## Troubleshooting
 
-**装完卡片没出现。** 卡片是开机时扫 entry point 的，装完要重启服务：
+**The cards do not show up after the install.** The cards are scanned from the entry
+points at boot, so restart the service after installing:
 
 ```bash
 cd ~/.wardner/wdnwebui && .venv/bin/python run.py
 ```
 
-**算力页报「功能未启用」。** 说明 `wdndds` 的 `.so` 没编出来。安装器不自行
-提权，下面两条**以 root 身份**执行：
+**The compute page says "功能未启用".** That means the `.so` of `wdndds` was not built.
+The installer does not elevate privileges — run the following two commands **as
+root**:
 
 ```bash
 apt-get install -y cmake build-essential patchelf libfoonathan-memory-dev
 bash ~/.wardner/wdnwebui/update_rkwhl.sh
 ```
 
-**HDMI-IN 快照端点一直 503。** 缺 `v4l2`（它只在 import 阶段才炸）：
+**The HDMI-IN snapshot endpoint keeps returning 503.** `v4l2` is missing (it only
+blows up at import time):
 
 ```bash
 cd ~/.wardner/wdnwebui
 .venv/bin/python scripts/fix_v4l2_py3.py
-.venv/bin/python scripts/check_sdk_deps.py    # 全量依赖审计
+.venv/bin/python scripts/check_sdk_deps.py    # full dependency audit
 ```
 
-**克隆超时。** GitHub 在部分网络下不稳。安装器自带重试（5 次，间隔 5s），
-一般能扛过去。仍不行就手动分步来，每一步都能看清卡在哪：
+**Clone times out / GitHub is unreachable.** GitHub is unstable on international
+networks; this is common. **Switch to the Gitee mirror** (fast domestically, the
+content is identical to GitHub):
 
 ```bash
-git clone https://github.com/rockchip-wardner/wdnwebui.git ~/.wardner/wdnwebui
-git clone https://github.com/rockchip-wardner/wdnav.git ~/.wardner/wdnwebui/.venv/src/wdnav
+curl -fsSL https://gitee.com/rockchip-wardner/wardner/raw/master/install.sh | bash
 ```
 
-> 全程走 **HTTPS 匿名 clone**，不需要 GitHub 账号、不需要 SSH key ——
-> 所以没登录过的用户也能装。
-
-**装完起不来：端口 8000 被占。** 板子上如果已经有另一个 wdnwebui 实例在跑
-（比如 systemd 单元 `wdnwebui.service` 指向旧的安装路径），再从 `~/.wardner`
-起一个就会两个进程抢 8000。systemd 那个 `Restart=on-failure` +
-`RestartSec=5` 会每 5 秒重启一轮，而且**每轮都把 cgroup 里的 compute_worker
-一起 SIGTERM 掉** —— 症状是「worker 加载完 ~33s 后 ~9s 就死」，很容易被
-误判成 NPU 加载有问题。
-
-排查顺序：
+If you already installed from GitHub, you can also make `wdn update` go through Gitee:
 
 ```bash
-systemctl status wdnwebui.service     # 有没有另一个实例
-ss -ltnp | grep :8000                 # 谁占着端口
+WARDNER_SOURCE_HOST=gitee.com wdn update
 ```
 
-二选一，别同时跑。
+The installer has retries built in (5 times, 5s apart), which usually rides it out. If
+it still fails, do it by hand, step by step — every step shows you where it got stuck:
+
+```bash
+git clone https://gitee.com/rockchip-wardner/wdnwebui.git ~/.wardner/wdnwebui
+git clone https://gitee.com/rockchip-wardner/wdnav.git ~/.wardner/wdnwebui/.venv/src/wdnav
+```
+
+> Everything goes over **anonymous HTTPS clone** (GitHub / Gitee): no GitHub account,
+> no SSH key — so users who never logged in can install too. The intranet goes over
+> ssh (see the protocol table above).
+
+**It will not start after the install: port 8000 is taken.** If another wdnwebui
+instance is already running on the board (for example the systemd unit
+`wdnwebui.service` pointing at an old install path), starting another one from
+`~/.wardner` puts two processes on port 8000. That systemd unit's
+`Restart=on-failure` + `RestartSec=5` restarts every 5 seconds, and **each round
+SIGTERMs the compute_worker in the cgroup** as well — the symptom is "the worker
+finishes loading, and ~9s later it dies", which is easily misdiagnosed as an NPU
+loading problem.
+
+Check in this order:
+
+```bash
+systemctl status wdnwebui.service     # is there another instance
+ss -ltnp | grep :8000                 # who holds the port
+```
+
+Pick one, do not run both.
+
+---
+
+## License
+
+Apache-2.0. See [LICENSE](LICENSE).

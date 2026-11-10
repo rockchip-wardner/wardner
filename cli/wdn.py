@@ -3,7 +3,7 @@
 
 子命令
 ------
-  update    把所有已下载的仓库更新到 GitHub 上的最新版本，并重新同步 venv
+  update    把所有已下载的仓库更新到**源站**（GitHub / Gitee 镜像）的最新版本，并重新同步 venv
   status    列出各仓的本地 commit、remote 和 venv 的就绪状态
   version   打印版本号
 
@@ -195,35 +195,107 @@ def norm_remote(url: str) -> str:
         git@github.com:org/repo.git
         ssh://git@github.com/org/repo.git
         https://github.com/org/repo.git
+
+    Gitee 同样处理 —— 源站不只 GitHub 一个，归一化不能按站写死。
     """
     u = (url or "").strip()
     if u.startswith("git+"):
         u = u[4:]
     if u.endswith(".git"):
         u = u[:-4]
-    u = u.replace("git@github.com:", "github.com/")
-    u = u.replace("ssh://git@github.com/", "github.com/")
-    u = u.replace("https://github.com/", "github.com/")
+    if u.startswith("ssh://"):
+        u = u[len("ssh://"):]
+    if u.startswith("git@"):
+        # git@github.com:org/repo → github.com:org/repo
+        u = u[4:].replace(":", "/", 1)
+    for scheme in ("https://", "http://"):
+        if u.startswith(scheme):
+            u = u[len(scheme):]
+            break
     return u.rstrip("/")
 
 
-def github_org_of(url: str) -> str:
-    """从 remote URL 反推 GitHub 组织名，取不到返回空串。"""
+def host_of(url: str) -> str:
+    """从 remote URL 反推源站主机名，取不到返回空串。
+
+    不限定 github.com —— Gitee 镜像、内网 GitLab 都得认。
+    """
     parts = norm_remote(url).split("/")
-    if len(parts) >= 3 and parts[0] == "github.com":
+    return parts[0] if parts and parts[0] else ""
+
+
+def org_of(url: str) -> str:
+    """从 remote URL 反推组织名，取不到返回空串。"""
+    parts = norm_remote(url).split("/")
+    if len(parts) >= 3:
         return parts[1]
     return ""
 
 
+def repo_of(url: str, fallback: str = "") -> str:
+    """从 remote URL 反推仓名，取不到返回 fallback。"""
+    parts = norm_remote(url).split("/")
+    if len(parts) >= 3 and parts[-1]:
+        return parts[-1]
+    return fallback
+
+
+# 只读镜像 —— 内容由上游自动同步，推上去会被覆盖。
+#
+# 这不是「风格偏好」，是**写错了会丢代码**：往镜像推的提交会在下一次同步时
+# 被上游版本覆盖，且没有任何提示。
+READONLY_HOSTS = {"gitee.com"}
+
+
+def host_is_readonly(host: str) -> bool:
+    return (host or "") in READONLY_HOSTS
+
+
 def resolve_org() -> str:
-    """本次操作使用的 GitHub 组织。
+    """本次操作使用的组织。
 
     优先环境变量，其次本仓 remote 里写着的（remote 是事实，推断归推断）。
     """
     env = os.environ.get("WARDNER_ORG")
     if env:
         return env
-    return github_org_of(remote_of(wardner_repo())) or "rockchip-wardner"
+    return org_of(remote_of(wardner_repo())) or "rockchip-wardner"
+
+
+def resolve_source_host() -> str:
+    """本次操作使用的**源站**（github.com / gitee.com / 内网 GitLab）。
+
+    优先环境变量，其次本仓 remote 里写着的 —— 从哪儿装的，`wdn update`
+    就继续走哪儿（国内拉 GitHub 慢，这正是装 Gitee 镜像的意义）。
+    """
+    env = os.environ.get("WARDNER_SOURCE_HOST")
+    if env:
+        return env
+    return host_of(remote_of(wardner_repo())) or "github.com"
+
+
+def source_scheme_for_host(host: str) -> str:
+    """源站 → 传输协议。
+
+    * **GitHub / Gitee 走 https** —— 公开仓，匿名 clone 就行，不需要账号 /
+      SSH key。这是「没登录过的用户也能装」的唯一路径。
+    * **内网走 ssh** —— 内网 GitLab 的 web 口在 8080，那是 HTTP 端口；
+      取码走 ssh 才是内网该有的方式。
+
+    协议由**源站**决定，不由取脚本用的 URL 协议决定：内网 GitLab 的 /raw/
+    页面是 http 的，但代码要从 ssh 拉。
+    """
+    return "https" if host in ("github.com", "gitee.com") else "ssh"
+
+
+def clone_url_for(host: str, org: str, repo: str) -> str:
+    """按源站拼 clone 地址（协议由源站决定）。
+
+    SSH 的 host 不带端口 —— web 的 8080 是 HTTP 端口，不是 SSH 端口。
+    """
+    if source_scheme_for_host(host) == "ssh":
+        return f"git@{host.split(':')[0]}:{org}/{repo}.git"
+    return f"https://{host}/{org}/{repo}.git"
 
 
 def pull(repo: Path, dry_run: bool = False, retries: int = 5, delay: int = 5):
@@ -281,17 +353,49 @@ def read_packages_conf(repo: Path) -> list[tuple[str, str]]:
     return out
 
 
+# 只出不进的远端名 —— 这些远端的 URL **不能**被对齐到源站。
+#
+# 组织策略（见 wdnwebui/AGENTS.md「仓库地址与同步策略」）：
+#   * 局域网主仓库 = 权威源，pull + push
+#   * GitHub        = 发布镜像，**只 push**
+#   * Gitee         = 不做任何操作
+#
+# 把 `github` 的 URL 改写成源站，就等于把「发布镜像」悄悄变成「主仓库的副本」
+# —— 用户执行 `git push github` 时其实推回了局域网，发布根本没发生，而且
+# **没有任何提示**。这是「悄悄改推送路径」里最隐蔽的一种。
+PUSH_ONLY_REMOTES = {"github"}
+
+
 def repo_name_of(repo: Path, fallback: str) -> str:
     """从 remote URL 反推仓名。"""
-    parts = norm_remote(remote_of(repo)).split("/")
-    if len(parts) >= 3 and parts[0] == "github.com":
-        return parts[-1]
-    return fallback
+    return repo_of(remote_of(repo), fallback)
+
+
+def _pushurl_of(repo: Path, rname: str) -> str:
+    """remote.<r>.pushurl 的**显式**值（没设返回空串）。
+
+    没设时 git 用 fetch URL 当 push 地址 —— 所以「空串」意味着「用户没表达
+    过推送意图」，我们才可以替他设。
+    """
+    return git_out(["config", "--get", f"remote.{rname}.pushurl"], repo)
+
+
+def _push_url_for(repo: Path, org: str, repo_name: str) -> str:
+    """这个仓该用的 push 地址（必须是**可写**站点）。
+
+    优先沿用仓里已有的可写 remote（保住它的协议 / 认证方式，例如内网 GitLab
+    的 SSH 形式）；一个都没有就退回 GitHub 的 https 形式。
+    """
+    for _rname, url in list_remotes(repo):
+        host = host_of(url)
+        if host and not host_is_readonly(host):
+            return url
+    return f"https://github.com/{org}/{repo_name}.git"
 
 
 def _sync_remotes(name: str, repo: Path, want_url: str, keep: bool = False,
-                  dry_run: bool = False) -> None:
-    """把仓的 remote 对齐到 GitHub，并保证 pull 真的从 GitHub 走。
+                  dry_run: bool = False, push_url: str = "") -> None:
+    """把仓的 remote 对齐到源站，并保证 pull 真的从源站走。
 
     ⚠️ remote 名不统一（origin / github / rk 都见过），而 `git pull` 不带
        参数时用的是 ``branch.<br>.remote`` —— **只改 origin 的 URL 是不生效
@@ -300,24 +404,45 @@ def _sync_remotes(name: str, repo: Path, want_url: str, keep: bool = False,
 
     规则：
 
-    * 所有 remote 的 URL 都指向 GitHub（内网镜像 → GitHub）；
-    * **只在**当前分支跟踪的 remote 不指向 GitHub 时，才把跟踪关系改到
-      一个指向 GitHub 的 remote —— 跟踪关系同时也是用户的推送路径，擅自
-      改会让 `git push` 悄悄改道。
+    * 所有 remote 的 URL 都指向源站（内网镜像 → GitHub / Gitee）；
+    * **只在**当前分支跟踪的 remote 不指向源站时，才把跟踪关系改到
+      一个指向源站的 remote —— 跟踪关系同时也是用户的推送路径，擅自
+      改会让 `git push` 悄悄改道；
+    * 源站是**只读镜像**（Gitee）时，另设 pushurl 指向可写站点：
+      fetch 走镜像（国内快），push 走 GitHub（镜像是只读的，推了会被
+      下一次同步覆盖）。
     """
     want_key = norm_remote(want_url)
+    want_host = host_of(want_url)
+    want_host_label = "Gitee 镜像" if want_host == "gitee.com" else want_host
+    readonly = host_is_readonly(want_host)
 
-    # ① URL 对齐
+    # ① URL 对齐（fetch）
     for rname, url in list_remotes(repo):
-        if norm_remote(url) == want_key or keep:
+        if rname in PUSH_ONLY_REMOTES:
+            # 只出不进的发布镜像 —— 不动它的 URL
+            if dry_run:
+                note(f"[dry-run] {name}: {rname} 保留（只 push 的发布镜像）")
             continue
-        if dry_run:
-            note(f"[dry-run] {name}: {rname} {url or '(空)'} → {want_url}")
-            continue
-        if _git(["remote", "set-url", rname, want_url], repo).returncode == 0:
-            ok(f"{name}: {rname} {url or '(空)'} → {want_url}")
+        if norm_remote(url) != want_key and not keep:
+            if dry_run:
+                note(f"[dry-run] {name}: {rname} {url or '(空)'} → {want_url}")
+            elif _git(["remote", "set-url", rname, want_url], repo).returncode == 0:
+                ok(f"{name}: {rname} {url or '(空)'} → {want_url}")
 
-    # ② 分支跟踪
+        # ② 只读镜像：push 路径单独指回可写站点
+        #
+        # 用户没设过 pushurl 时才替他设 —— 设了就说明用户表达过推送意图，
+        # 擅自改同样是「悄悄改推送路径」。
+        if readonly and push_url and not keep:
+            if _pushurl_of(repo, rname):
+                continue
+            if dry_run:
+                note(f"[dry-run] {name}: {rname} pushurl → {push_url}")
+            elif _git(["remote", "set-url", "--push", rname, push_url], repo).returncode == 0:
+                ok(f"{name}: {rname} push → {push_url}（源站是只读镜像）")
+
+    # ③ 分支跟踪
     br = current_branch(repo)
     if keep or not br or br == "HEAD":
         return
@@ -331,9 +456,9 @@ def _sync_remotes(name: str, repo: Path, want_url: str, keep: bool = False,
             break
 
     if tracked and norm_remote(tracked_url) == want_key:
-        return   # 已经在 GitHub 上 —— 不动用户的跟踪关系
+        return   # 已经在源站上 —— 不动用户的跟踪关系
 
-    # 挑一个指向 GitHub 的 remote：优先 HTTPS（匿名可用）
+    # 挑一个指向源站的 remote：优先 HTTPS（匿名可用）
     pick = ""
     for rname, url in remotes:
         if norm_remote(url) == want_key and url.startswith("https://"):
@@ -357,7 +482,7 @@ def _sync_remotes(name: str, repo: Path, want_url: str, keep: bool = False,
     _git(["config", f"branch.{br}.remote", pick], repo)
     if br == "master":
         _git(["config", f"branch.{br}.merge", "refs/heads/master"], repo)
-    ok(f"{name}: 分支 {br} 跟踪 {tracked or '(无)'} → {pick}（GitHub）")
+    ok(f"{name}: 分支 {br} 跟踪 {tracked or '(无)'} → {pick}（{want_host_label}）")
 
 
 # ---------------------------------------------------------------------------
@@ -379,6 +504,7 @@ def cmd_update(args: argparse.Namespace) -> int:
         return 2
 
     org = resolve_org()
+    source_host = resolve_source_host()
     host_name = os.environ.get("WARDNER_HOST_REPO") or "wdnwebui"
     results: list[tuple[str, str, str, bool, str]] = []  # 名, before, after, ok, msg
 
@@ -399,22 +525,29 @@ def cmd_update(args: argparse.Namespace) -> int:
             if (dest / ".git").is_dir():
                 continue
             note(f"{pkg} 缺失 —— clone")
-            if not clone(f"https://github.com/{org}/{repo_name}.git", dest, args.dry_run):
+            if not clone(clone_url_for(source_host, org, repo_name), dest, args.dry_run):
                 bad(f"{pkg} 拉取失败")
 
-    # ③ remote 对齐 GitHub
+    # ③ remote 对齐源站
     #
-    # 「wdn update 通过 GitHub 更新」是硬要求。仓的 remote 被指到内网镜像时，
-    # 这里改回 GitHub；分支跟踪关系只在「跟踪的 remote 不指向 GitHub」时才
-    # 动 —— 跟踪关系也是用户的推送路径，擅自改会让 `git push` 改道。
-    step("对齐 remote 到 GitHub")
+    # 「wdn update 通过源站更新」是硬要求：源站是哪个（GitHub / Gitee 镜像）
+    # 由**本仓的 remote**决定 —— 从哪儿装的，更新还走哪儿。
+    # 分支跟踪关系只在「跟踪的 remote 不指向源站」时才动 —— 跟踪关系也是
+    # 用户的推送路径，擅自改会让 `git push` 改道。
+    step(f"对齐 remote 到 {source_host}")
     for name, path, repo_name in _all_repos(wrepo, hrepo, pkgs, host_name):
         if not (path / ".git").is_dir():
             continue
         _sync_remotes(
-            name, path, f"https://github.com/{org}/{repo_name}.git",
+            name, path, clone_url_for(source_host, org, repo_name),
             keep=args.keep_remotes, dry_run=args.dry_run,
+            push_url=_push_url_for(path, org, repo_name),
         )
+
+    if host_is_readonly(source_host):
+        warn(f"{source_host} 是只读镜像（内容由上游自动同步）—— 拉取/更新走它没问题，")
+        warn("但**不要往它推代码**：推送请用 GitHub 或内网主仓库。")
+        warn("（pushurl 已指向可写站点，用户没自定义过 pushurl 时由 wdn 自动设好）")
 
     # ④ pull 宿主应用
     step("拉取最新代码")
@@ -442,7 +575,12 @@ def cmd_update(args: argparse.Namespace) -> int:
     if args.dry_run:
         note("[dry-run] 跳过 update_rkwhl.sh（它会真的 pip install）")
     else:
-        env = {**os.environ, "WARDNER_PKG_BASE": f"git+https://github.com/{org}"}
+        # 包来源前缀跟着源站走（协议由源站决定：GitHub/Gitee → https，内网 → ssh）
+        if source_scheme_for_host(source_host) == "ssh":
+            pkg_base = f"git+ssh://git@{source_host.split(':')[0]}/{org}"
+        else:
+            pkg_base = f"git+https://{source_host}/{org}"
+        env = {**os.environ, "WARDNER_PKG_BASE": pkg_base}
         r = subprocess.run(
             ["bash", str(script)],
             cwd=str(hrepo),
@@ -606,10 +744,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--version", action="version", version=f"wdn {VERSION}")
     sub = p.add_subparsers(dest="cmd")
 
-    up = sub.add_parser("update", help="把所有已下载的仓更新到 GitHub 最新，并重新同步 venv")
+    up = sub.add_parser("update", help="把所有已下载的仓更新到源站最新（GitHub / Gitee 镜像），并重新同步 venv")
     up.add_argument("--dry-run", action="store_true", help="只看会发生什么，不真的 pull / 装包")
     up.add_argument("--keep-remotes", action="store_true",
-                    help="不动各仓的 remote 和分支跟踪（默认会对齐到 GitHub）")
+                    help="不动各仓的 remote 和分支跟踪（默认会对齐到源站）")
     up.set_defaults(func=cmd_update)
 
     st = sub.add_parser("status", help="列出各仓的 commit / remote 和 venv 状态")

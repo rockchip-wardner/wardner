@@ -20,16 +20,29 @@ wardner_target_home() {
 # ---------------------------------------------------------------------------
 # 配置（都可用环境变量覆盖，方便测试与定制）
 #
-# WARDNER_ORG / WARDNER_REPO_NAME 由 install.sh 的 bootstrap 阶段**推断**
-# 出来（从脚本自身的来源 URL 反推，见 lib/urls.sh）—— 硬编码组织名的话，
-# 换个组织 / 换个 fork 就得改代码。这里只是兜底默认值。
+# WARDNER_SOURCE_HOST / WARDNER_ORG / WARDNER_REPO_NAME 由 install.sh 的
+# bootstrap 阶段**推断**出来（从脚本自身的来源 URL 反推，见 lib/urls.sh）——
+# 硬编码组织名的话，换个组织 / 换个 fork / 换个镜像站就得改代码。这里只是兜底默认值。
+#
+# 源站有两个：
+#   * github.com —— 权威仓库，可 push
+#   * gitee.com  —— 国内**只读镜像**，内容由上游自动同步，**不要往它推**
+# 从哪个站装的，宿主应用和 8 个 SDK / 插件包就都走哪个站（国内网络走 Gitee 快）。
 # ---------------------------------------------------------------------------
+
+# 用户**显式**指定的包来源前缀（可能为空）。留个副本：resolve_source 会按
+# 源站重算 WARDNER_PKG_BASE，但没有这个副本，用户在环境变量里指定的
+# 内网镜像地址会被**静默覆盖** —— 那正是 README 里写明的用法。
+WARDNER_PKG_BASE_ENV="${WARDNER_PKG_BASE:-}"
+
 : "${WARDNER_HOME:=$(wardner_target_home)/.wardner}"   # 安装根目录
-: "${WARDNER_ORG:=rockchip-wardner}"                # GitHub 组织（由来源 URL 推断）
-: "${WARDNER_REPO_NAME:=wardner}"                   # 本仓名（由来源 URL 推断）
-: "${WARDNER_REPO_URL:=https://github.com/$WARDNER_ORG/$WARDNER_REPO_NAME.git}"
-: "${WARDNER_HOST_REPO:=wdnwebui}"                  # 宿主应用仓名
-: "${WARDNER_PKG_BASE:=git+https://github.com/$WARDNER_ORG}"
+: "${WARDNER_SOURCE_HOST:=github.com}"                # 源站（github.com / gitee.com）
+: "${WARDNER_SOURCE_SCHEME:=$(source_scheme_for_host "$WARDNER_SOURCE_HOST")}"  # 源站协议
+: "${WARDNER_ORG:=rockchip-wardner}"                  # 组织（由来源 URL 推断）
+: "${WARDNER_REPO_NAME:=wardner}"                     # 本仓名（由来源 URL 推断）
+: "${WARDNER_REPO_URL:=https://$WARDNER_SOURCE_HOST/$WARDNER_ORG/$WARDNER_REPO_NAME.git}"
+: "${WARDNER_HOST_REPO:=wdnwebui}"                    # 宿主应用仓名
+: "${WARDNER_PKG_BASE:=git+https://$WARDNER_SOURCE_HOST/$WARDNER_ORG}"
 : "${WARDNER_PYTHON:=python3}"
 : "${WARDNER_BRANCH:=master}"
 
@@ -114,10 +127,15 @@ git_retry() {
 }
 
 # 克隆或快进一个仓库。已存在则 pull --ff-only（本地有改动 / 分叉时不硬来）。
-# $1 = 目标目录  $2 = GitHub 仓库名
+# $1 = 目标目录  $2 = 仓库名
+#
+# ⚠️ clone 地址跟着**源站**走 —— 从 Gitee 装的，8 个包也走 Gitee（国内快）。
+#    协议也跟着源站：内网 GitLab 走 http://10.10.10.10:8080/... 时，写死
+#    https 会直接连不上。
 fetch_repo() {
     local dir="$1" name="$2"
-    local url="https://github.com/$WARDNER_ORG/$name.git"
+    local url
+    url="$(repo_clone_url_for "$WARDNER_SOURCE_SCHEME" "$WARDNER_SOURCE_HOST" "$WARDNER_ORG" "$name")"
 
     if [ -d "$dir/.git" ]; then
         log "更新 $name"
