@@ -7,8 +7,9 @@ Subcommands
             **source site** (GitHub / the Gitee mirror) and re-sync the venv
   status    list the local commit, the remote and the readiness of the venv
             for every repo
-  doctor    check the system environment: the native .so files, the SDK
-            versions, the dependency versions, the plugin registration
+  doctor    check the system environment: the native .so files, the **system
+            libraries of the hardware engines** (MPP / RGA / Mali / RKNN),
+            the SDK versions, the dependency versions, the plugin registration
   version   print the version
 
 Runs with the **venv python** (see bin/wdn)
@@ -805,7 +806,7 @@ def cmd_version(args: argparse.Namespace) -> int:
 #
 # A health check for the whole installation. The question it answers is
 # "is this board actually able to run the thing, and if not, what exactly
-# is missing?" — with the emphasis on the two failure classes that are
+# is missing?" — with the emphasis on the three failure classes that are
 # invisible until something breaks:
 #
 #   1. a native library is missing (the .so of wdndds / wdnav was never
@@ -814,10 +815,19 @@ def cmd_version(args: argparse.Namespace) -> int:
 #   2. a version does not match (the source tree was pulled but the
 #      package was not reinstalled → the .so is older than the sources;
 #      a pinned dependency is not satisfied → a different API than the
-#      one the SDK was written against).
+#      one the SDK was written against);
+#   3. a **system library of the hardware engine** is missing (the MPP /
+#      RGA / Mali / RKNN runtime that apt provides) — the SDKs load them
+#      lazily and swallow the error, so the import works and only the
+#      video pipeline / the NPU is dead.
 #
 # The check is read-only: it never installs, never pulls and never
 # modifies anything, so it is safe to run on a live board.
+#
+# ⚠️ It does not touch the hardware either: the libraries are resolved
+#    with `ldd` (which never runs the library) instead of dlopen — the
+#    NPU runtime would initialise the NPU driver on load, and that must
+#    not happen next to a live session.
 # ---------------------------------------------------------------------------
 
 # The native libraries that have to be there after the install.
@@ -852,6 +862,68 @@ def _parse_requirement(raw: str) -> tuple[str, str] | None:
     if not m:
         return None
     return m.group(1), (m.group(3) or "").strip()
+
+
+# The markers of the managed block that install.sh writes into the rc
+# files — the same text as lib/common.sh (WARDNER_RC_BEGIN / _END).
+WARDNER_RC_BEGIN = "# >>> wardner (wdn) >>>"
+WARDNER_RC_END = "# <<< wardner (wdn) <<<"
+
+
+def _rc_files() -> list[Path]:
+    """The rc files the installer writes the PATH into.
+
+    ~/.bashrc always, ~/.zshrc when it exists or when zsh is the login
+    shell — a zsh shell never reads ~/.bashrc, so a block that only
+    landed there leaves the command unusable.
+    """
+    home = Path.home()
+    out = [home / ".bashrc"]
+    if (home / ".zshrc").is_file() or os.environ.get("SHELL", "").endswith("zsh"):
+        out.append(home / ".zshrc")
+    return out
+
+
+def _check_wdn_on_path() -> int:
+    """Can the user run `wdn` directly?
+
+    Two different things are checked:
+      * the **rc files** — the install writes the PATH into them, and a
+        missing block means the install did not reach that shell;
+      * the **PATH of this shell** — a terminal that was already open
+        when the install ran has not picked the block up yet.
+    """
+    problems = 0
+    step("The wdn command")
+
+    for rc in _rc_files():
+        text = ""
+        try:
+            text = rc.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            pass
+        if WARDNER_RC_BEGIN in text and WARDNER_RC_END in text:
+            ok(f"{rc} — the managed block is there")
+        else:
+            warn(f"{rc} — no managed block: a shell that reads this file "
+                 "will not find wdn")
+            note(f"  re-run the installer: bash {wardner_repo() / 'install.sh'}")
+
+    bindir = wardner_repo() / "bin"
+    entries = [p for p in os.environ.get("PATH", "").split(os.pathsep) if p]
+    if str(bindir) in entries:
+        ok(f"on the PATH: {bindir}")
+        return problems
+
+    local_bin = Path.home() / ".local" / "bin"
+    if str(local_bin) in entries and (local_bin / "wdn").exists():
+        ok(f"on the PATH through the symlink: {local_bin / 'wdn'}")
+        return problems
+
+    warn("the wdn command is not on the PATH of this shell")
+    note(f"  export PATH=\"{bindir}:$PATH\"")
+    note("  or open a new terminal — the rc files are read when the shell starts")
+    return problems
 
 
 def _installed_version(name: str) -> str | None:
@@ -1086,6 +1158,437 @@ def _check_native_libs(pkgs: list[tuple[str, str]]) -> int:
     return problems
 
 
+# ---------------------------------------------------------------------------
+# The hardware: the system libraries the SDKs load at runtime
+#
+# They are **not** part of the wheels — apt provides them. A missing one
+# does not break the import (the SDKs load the libraries lazily and
+# swallow the error), it breaks the *feature* — and only when the feature
+# is used:
+#
+#   wdnav  VideoCapture    → MPP (hw codec) + RGA (colour conversion)
+#   wdnav  SurfaceComposer → Mali (GPU) through the C shim
+#   wdnai  the cshim       → librknn3_api.so (RKNN3) / librknnrt.so (RKNN2)
+#
+# That is the class of failure the doctor has to catch: everything
+# imports, the app starts, and only the video pipeline / the NPU is dead.
+# ---------------------------------------------------------------------------
+
+# package → [(soname, apt package, what it is for, optional)]
+#
+# "optional" = the SDK has a fallback when the library is missing → a
+# note, not a problem.
+SYSTEM_LIBS: dict[str, list[tuple[str, str, str, bool]]] = {
+    "wdnav": [
+        ("librockchip_mpp.so.0", "librockchip-mpp1",
+         "VPU hardware codec (hw decode / encode)", False),
+        ("librga.so.2", "librga2",
+         "RGA2 colour conversion / scaling", False),
+        ("libmali.so", "libmali-valhall-g610-g24p0-x11-wayland-gbm",
+         "GPU (EGL / GLES) offscreen rendering", False),
+        ("libfreetype.so.6", "libfreetype6",
+         "text rasterisation (the Typer of SurfaceComposer)", False),
+        ("libv4l2.so.0", "libv4l2-0",
+         "the V4L2 helper library (the v4l2 python package talks raw ioctl)", True),
+    ],
+    "wdnai": [
+        ("librknn3_api.so", "rknn3-rk182x-sodimm",
+         "RKNN3 NPU runtime — the only hard dependency of the cshim", False),
+        ("librknn3_api_rkcp.so", "rknn3-rk182x-sodimm",
+         "RKNN3 PCIe back-end (the RK182x co-processor cards)", True),
+        ("librknnrt.so", "rknn2-runtime",
+         "RKNN2 NPU runtime (the on-board NPU) — without it the VAE falls "
+         "back to the slower rknn3 chain", True),
+        ("librknnsmi.so", "rknn3-rk182x-sodimm",
+         "NPU topology query (RKNN3 SMI)", True),
+    ],
+}
+
+# The C shims that are compiled from the sources at install time (they are
+# gitignored build artifacts — a fresh clone has none of them):
+#   package → {shim: (mandatory, remedy)}
+#
+# libshim_video.so is not listed here — it is in REQUIRED_SO, the native
+# section checks it (including its DT_NEEDED chain).
+#
+# libshim_mali.so is not mandatory for the *package* (the video path does
+# not need it), but without it the GPU features (SurfaceComposer / Typer)
+# are silently None — wdnav swallows the OSError of the dlopen.
+SHIM_SO: dict[str, dict[str, tuple[bool, str]]] = {
+    "wdnav": {
+        "libshim_mali.so": (False, (
+            "the GPU features (SurfaceComposer / Typer) need it — the shim is compiled\n"
+            "  from src/wdnav/cshim_mali.c and needs the EGL / GLES / freetype headers:\n"
+            "    sudo apt-get install -y libegl-dev libgles2-mesa-dev libfreetype-dev\n"
+            "    .venv/bin/pip install --force-reinstall --no-deps .venv/src/wdnav")),
+    },
+    "wdnai": {
+        "libqi_qwen.so": (False, ""),
+    },
+}
+
+
+def _lib_search_dirs() -> list[str]:
+    """The directories the dynamic linker searches on this board."""
+    import sysconfig
+
+    dirs = ["/usr/lib", "/usr/local/lib", "/lib", "/opt/lib"]
+    multi = sysconfig.get_config_var("MULTIARCH")   # aarch64-linux-gnu
+    if multi:
+        dirs += [f"/usr/lib/{multi}", f"/lib/{multi}", f"/usr/local/lib/{multi}"]
+    # the Rockchip GPU driver installs into a directory of its own
+    dirs.append("/usr/lib/aarch64-linux-gnu/mali")
+    return dirs
+
+
+def _find_system_lib(soname: str) -> Path | None:
+    """The file that provides `soname`.
+
+    The exact name first (``/usr/lib/librknn3_api.so``), then the
+    versioned sibling (``librga.so.2`` → ``librga.so.2.1.0``): apt
+    installs the soname as a symlink, the versioned file is the one that
+    carries the real version.
+    """
+    dirs = _lib_search_dirs()
+    for d in dirs:
+        p = Path(d) / soname
+        if p.is_file():
+            return p
+    if ".so" in soname:
+        prefix = soname[: soname.index(".so") + 3]
+        for d in dirs:
+            try:
+                for p in sorted(Path(d).glob(prefix + ".*")):
+                    if p.is_file() and p.name.startswith(soname + "."):
+                        return p
+            except OSError:
+                continue
+    return None
+
+
+def _apt_versions(packages: list[str]) -> dict[str, str]:
+    """{apt package: installed version} — only the installed ones."""
+    dpkg = shutil.which("dpkg-query")
+    if not dpkg:
+        return {}
+    out: dict[str, str] = {}
+    for pkg in packages:
+        try:
+            r = subprocess.run(
+                [dpkg, "-W", "-f=${Package}\t${Version}\n", pkg],
+                capture_output=True, text=True, timeout=20,
+                stdin=subprocess.DEVNULL,
+            )
+        except Exception:
+            continue
+        if r.returncode != 0:
+            continue
+        for line in r.stdout.splitlines():
+            parts = line.split("\t")
+            if len(parts) == 2:
+                out[parts[0]] = parts[1]
+    return out
+
+
+def _unresolved_deps(path: Path) -> list[str]:
+    """The dependencies of a shared library that the linker cannot resolve.
+
+    `ldd` resolves the DT_NEEDED entries **without** running the library —
+    that matters here: dlopen'ing the NPU runtime would initialise the
+    NPU driver, and a health check must not touch the hardware of a live
+    session. The DT_NEEDED chain of the shims is what ties the system
+    libraries to the SDKs anyway.
+    """
+    ldd = shutil.which("ldd")
+    if not ldd:
+        return []
+    try:
+        r = subprocess.run(
+            [ldd, str(path)], capture_output=True, text=True, timeout=30,
+            stdin=subprocess.DEVNULL,
+        )
+    except Exception:
+        return []
+    out = f"{r.stdout}\n{r.stderr}"
+    return [ln.strip() for ln in out.splitlines() if "not found" in ln]
+
+
+def _real_path(p: Path) -> Path:
+    """The file behind a symlink — the versioned file carries the version."""
+    try:
+        return p.resolve(strict=False)
+    except OSError:
+        return p
+
+
+def _check_hardware_libs(pkgs: list[tuple[str, str]]) -> int:
+    """The system libraries the SDKs load at runtime."""
+    problems = 0
+    step("Hardware libraries")
+
+    installed = {p for p, _ in pkgs}
+    order = [p for p, _ in pkgs]          # the order of packages.conf
+    specs = [(pkg, spec) for pkg in order for spec in SYSTEM_LIBS.get(pkg, [])]
+    shims = [(pkg, name, meta) for pkg in order
+             for name, meta in SHIM_SO.get(pkg, {}).items()]
+    if not specs and not shims:
+        warn("no system library is declared for the installed packages")
+        return 0
+
+    versions = _apt_versions(sorted({spec[1] for _, spec in specs}))
+    width = max([len(p) for p, _ in specs] + [len(p) for p, _, _ in shims])
+
+    for pkg, (soname, apt_pkg, purpose, optional) in specs:
+        label = f"{pkg:<{width}}  {soname}"
+        found = _find_system_lib(soname)
+        if found is None:
+            if optional:
+                warn(f"{label} — not installed (optional: {purpose})")
+            else:
+                bad(f"{label} — MISSING ({purpose})")
+                note(f"  install it: sudo apt-get install -y {apt_pkg}")
+                problems += 1
+            continue
+
+        ver = versions.get(apt_pkg, "")
+        tail = f"  ({apt_pkg} {ver})" if ver else f"  (not from {apt_pkg})"
+        unresolved = _unresolved_deps(found)
+        if unresolved:
+            bad(f"{label} → {_real_path(found)}{tail}")
+            note(f"  {len(unresolved)} unresolved dependenc"
+                 f"{'y' if len(unresolved) == 1 else 'ies'}:")
+            for m in unresolved:
+                note(f"  {m}")
+            problems += 1
+        elif not ver:
+            warn(f"{label} → {_real_path(found)}{tail}")
+        else:
+            ok(f"{label} → {_real_path(found)}{tail}")
+
+    for pkg, name, (mandatory, remedy) in shims:
+        label = f"{pkg:<{width}}  {name}"
+        so = _find_so(name, venv_src() / pkg)
+        if so is None:
+            if mandatory:
+                bad(f"{label} — the shim was not built")
+                problems += 1
+            else:
+                warn(f"{label} — not built")
+            if remedy:
+                note(remedy)
+            else:
+                note("  rebuild it: bash " + str(host_repo() / "update_rkwhl.sh"))
+            continue
+        unresolved = _unresolved_deps(so)
+        if unresolved:
+            bad(f"{label} → {so}")
+            note(f"  {len(unresolved)} unresolved dependenc"
+                 f"{'y' if len(unresolved) == 1 else 'ies'}:")
+            for m in unresolved:
+                note(f"  {m}")
+            problems += 1
+        else:
+            ok(f"{label} → {so}")
+    return problems
+
+
+# The capabilities the SDKs expose through their module attributes. The
+# SDKs set the attribute to None when the library behind it could not be
+# loaded — so the attribute **is** the report of the hardware chain.
+#
+#   wdnav.VideoCapture    → MPP + RGA
+#   wdnav.SurfaceComposer → Mali (GPU) through the C shim
+#   wdnav.Typer           → Mali (GPU) + freetype
+#   wdnav.MediaDevice     → media-ctl in PATH
+#
+# "mandatory" = the feature is part of the SDK's contract.
+CAPABILITIES = [
+    ("wdnav", "VideoCapture", True, "the hardware video codec (MPP) + RGA"),
+    ("wdnav", "SurfaceComposer", True, "the GPU (Mali) offscreen rendering"),
+    ("wdnav", "Typer", True, "the GPU text rendering (Mali + freetype)"),
+    ("wdnav", "MediaDevice", False, "the media-ctl based device graph"),
+]
+
+
+def _check_hardware_capabilities() -> int:
+    """Can the SDKs really use the hardware?
+
+    The import of an SDK does **not** open the hardware: wdnav loads the
+    libraries inside a try/except and sets the class to None when that
+    fails. So "import wdnav: ok" says nothing about the MPP / RGA /
+    Mali chain — only the attributes do.
+
+    The probe runs in a child process: loading the libraries has side
+    effects (the RGA library writes a banner to stdout when the
+    interpreter tears down), and a crashing library must not take the
+    doctor down with it.
+    """
+    problems = 0
+    step("Hardware capabilities")
+
+    import json
+
+    marker = "__WDN_CAP_RESULT__"
+    code = (
+        "import json,sys\n"
+        "spec=json.loads(sys.argv[1])\n"
+        "out={}\n"
+        "for mod,attrs in spec:\n"
+        "    try:\n"
+        "        m=__import__(mod)\n"
+        "    except Exception as e:\n"
+        "        out[mod]='%s: %s' % (type(e).__name__, e)\n"
+        "        continue\n"
+        "    out[mod]='ok'\n"
+        "    for a in attrs:\n"
+        "        out[mod+'.'+a]='ok' if getattr(m,a,None) is not None else 'unavailable'\n"
+        "sys.stderr.write('\\n' + sys.argv[2] + json.dumps(out))\n"
+    )
+    spec = json.dumps([["wdnav", [a for _, a, _, _ in CAPABILITIES]], ["wdnai", []]])
+    try:
+        r = subprocess.run(
+            [sys.executable, "-c", code, spec, marker],
+            capture_output=True, text=True, timeout=120,
+            stdin=subprocess.DEVNULL,
+        )
+        blob = r.stderr.strip().splitlines()
+        line = next((ln for ln in reversed(blob) if ln.startswith(marker)), "")
+        res = json.loads(line[len(marker):]) if line else {}
+    except Exception as e:
+        bad(f"could not run the capability probe: {e}")
+        return 1
+
+    if not res:
+        bad("the capability probe did not report anything")
+        problems += 1
+
+    for mod, attr, mandatory, purpose in CAPABILITIES:
+        key = f"{mod}.{attr}"
+        state = res.get(key)
+        if state == "ok":
+            ok(f"{key} — {purpose}")
+        elif state == "unavailable":
+            if mandatory:
+                bad(f"{key} — unavailable ({purpose})")
+                note("  the library behind it could not be loaded — see the "
+                     "hardware libraries above")
+                problems += 1
+            else:
+                warn(f"{key} — unavailable ({purpose})")
+        elif state is None:
+            warn(f"{key} — could not be determined ({res.get(mod, 'no answer')})")
+        else:
+            bad(f"{key} — {state}")
+            problems += 1
+
+    # The NPU runtime is loaded lazily, so the import of wdnai proves
+    # nothing about it — the libraries above are the evidence.
+    if res.get("wdnai") == "ok":
+        ok("wdnai — imported (the RKNN3 runtime itself is loaded lazily)")
+    elif "wdnai" in res:
+        bad(f"wdnai — {res['wdnai']}")
+        problems += 1
+    return problems
+
+
+# The device nodes the hardware engines need. The library without its
+# node is still broken: the dlopen succeeds, the first ioctl fails.
+HARDWARE_NODES = [
+    ("/dev/mpp_service", "VPU — the hardware codec", True),
+    ("/dev/rga", "RGA2 — the 2D accelerator", True),
+    ("/dev/mali0", "Mali — the GPU", True),
+]
+
+
+def _rknn_device() -> str:
+    """The device node the rknn2 runtime opens.
+
+    The RKNPU driver registers a DRM card (``/dev/dri/cardN``) and the
+    runtime opens it through that path (``/dev/dri/%s``); the legacy
+    misc node ``/dev/rknpu`` is the fallback. Which card is the NPU is
+    **not** a fixed number — it is the one the RKNPU driver is bound to,
+    so the driver is looked up in sysfs instead of guessing card1 (on
+    this board card0 is the display).
+    """
+    drm = Path("/sys/class/drm")
+    if drm.is_dir():
+        for card in sorted(drm.glob("card*")):
+            try:
+                uevent = (card / "device" / "uevent").read_text()
+            except OSError:
+                continue
+            if "DRIVER=RKNPU" in uevent:
+                return f"/dev/dri/{card.name}"
+    if Path("/dev/rknpu").exists():
+        return "/dev/rknpu"
+    return ""
+
+
+def _check_hardware_nodes() -> int:
+    """The device nodes of the hardware engines.
+
+    The libraries can be installed while the driver is missing — that is
+    the second half of the "the video pipeline does nothing" failure.
+    """
+    problems = 0
+    step("Hardware nodes")
+
+    nodes = [(p, w, r) for p, w, r in HARDWARE_NODES]
+    rknn = _rknn_device()
+    if rknn:
+        nodes.append((rknn, "the on-board NPU (rknn2)", True))
+
+    for path, what, required in nodes:
+        if not os.path.exists(path):
+            if required:
+                bad(f"{path} — missing ({what})")
+                problems += 1
+            else:
+                warn(f"{path} — missing ({what}) — optional")
+            continue
+        # The nodes belong to root:video — a user outside that group gets
+        # EACCES at the first ioctl, long after the import succeeded.
+        if not os.access(path, os.R_OK | os.W_OK):
+            warn(f"{path} — {what} — the current user cannot open it")
+            continue
+        ok(f"{path} — {what}")
+
+    if not rknn:
+        warn("no RKNPU device found (a /dev/dri/card* bound to the RKNPU "
+             "driver, or the legacy /dev/rknpu): the rknn2 runtime is "
+             "installed but cannot open the NPU")
+
+    # The DMA heaps are a **directory** of device nodes: the directory
+    # only has to be traversable, the nodes inside have to be writable.
+    heaps = Path("/dev/dma_heap")
+    if not heaps.is_dir():
+        warn("/dev/dma_heap — missing (the zero-copy paths) — optional")
+    elif not os.access(heaps, os.X_OK | os.R_OK):
+        warn("/dev/dma_heap — the current user cannot traverse it")
+    else:
+        nodes = sorted(p for p in heaps.iterdir() if p.is_char_device())
+        if not nodes:
+            warn("/dev/dma_heap — the directory holds no DMA heap node")
+        else:
+            blocked = [p.name for p in nodes if not os.access(p, os.R_OK | os.W_OK)]
+            if blocked:
+                warn(f"/dev/dma_heap — the current user cannot open: "
+                     f"{', '.join(blocked)}")
+            else:
+                ok(f"/dev/dma_heap — the DMA heaps "
+                   f"({', '.join(p.name for p in nodes)})")
+
+    # The NPU co-processor cards (the RK1828 PCIe cards) register a misc
+    # device each.
+    misc = Path("/sys/class/misc")
+    cards = sorted(p.name for p in misc.glob("pcie-rkep-*")) if misc.is_dir() else []
+    if cards:
+        ok(f"the NPU co-processor cards: {len(cards)} ({', '.join(cards)})")
+    else:
+        warn("no NPU co-processor card found (/sys/class/misc/pcie-rkep-*)")
+    return problems
+
+
 def _check_sdk_imports() -> int:
     """Can the SDKs really be imported?"""
     problems = 0
@@ -1274,7 +1777,15 @@ def _check_plugins(pkgs: list[tuple[str, str]]) -> int:
 
 def _check_repos(online: bool = False) -> int:
     """The state of the repos — and with --online whether they are behind
-    their remote."""
+    their remote.
+
+    Only the two repos that **wdn itself pulls** are compared with the
+    source site: wardner and the host application. The 8 SDK packages
+    are updated by ``update_rkwhl.sh``, which manages their remotes on
+    its own — their tracked remote may legitimately be the Gitee mirror
+    (a read-only mirror is a valid source, see ``READONLY_HOSTS``), so
+    comparing it with the source site produces nothing but noise.
+    """
     problems = 0
     step("Repos")
     wrepo = wardner_repo()
@@ -1282,6 +1793,7 @@ def _check_repos(online: bool = False) -> int:
     pkgs = read_packages_conf(wrepo)
     host_name = os.environ.get("WARDNER_HOST_REPO") or "wdnwebui"
     source_host = resolve_source_host()
+    managed = {repo_name_of(wrepo, wrepo.name), host_name}
 
     for name, path, _ in _all_repos(wrepo, hrepo, pkgs, host_name):
         if not (path / ".git").is_dir():
@@ -1299,7 +1811,7 @@ def _check_repos(online: bool = False) -> int:
         if not url:
             warn(f"{name}: {sha} — no remote is tracked")
             continue
-        if h != source_host:
+        if name in managed and h != source_host:
             warn(f"{name}: {sha} — the tracked remote points at {h or 'an unknown host'},"
                  f" not at the source site {source_host}")
         else:
@@ -1316,6 +1828,10 @@ def _check_repos(online: bool = False) -> int:
                     problems += 1
                 else:
                     ok(f"{name}: up to date with {h}")
+
+    note(f"the source site is {source_host} — only {' / '.join(sorted(managed))} are compared "
+         "against it;")
+    note("the SDK packages are pulled by update_rkwhl.sh, their remote may be the Gitee mirror")
     return problems
 
 
@@ -1325,8 +1841,12 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
     problems = 0
     problems += _check_system()
+    problems += _check_wdn_on_path()
     problems += _check_toolchain()
     problems += _check_native_libs(pkgs)
+    problems += _check_hardware_libs(pkgs)
+    problems += _check_hardware_capabilities()
+    problems += _check_hardware_nodes()
     problems += _check_sdk_imports()
     problems += _check_sdk_versions(pkgs)
     problems += _check_requirement_versions()
@@ -1361,7 +1881,7 @@ def build_parser() -> argparse.ArgumentParser:
     st = sub.add_parser("status", help="list the commit / remote of every repo and the state of the venv")
     st.set_defaults(func=cmd_status)
 
-    dr = sub.add_parser("doctor", help="check the system environment: the native .so files, the SDK versions, the dependency versions, the plugin registration")
+    dr = sub.add_parser("doctor", help="check the system environment: the native .so files, the system libraries of the hardware engines (MPP / RGA / Mali / RKNN), the SDK versions, the dependency versions, the plugin registration")
     dr.add_argument("--online", action="store_true",
                     help="also compare the local HEAD with the tip of the remote (needs the network)")
     dr.set_defaults(func=cmd_doctor)

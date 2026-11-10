@@ -6,8 +6,9 @@
 #   wdn status     show the local commit / remote of every repo and the
 #                  state of the venv
 #   wdn doctor     check the system environment: the native .so files, the
-#                  SDK versions, the dependency versions, the plugin
-#                  registration
+#                  system libraries of the hardware engines (MPP / RGA /
+#                  Mali / RKNN), the SDK versions, the dependency
+#                  versions, the plugin registration
 #   wdn version    print the version
 #
 # Two layers:
