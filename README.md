@@ -233,32 +233,32 @@ model claims is listed at the end.
 itself, the host app, the four SDKs and the card plugins:
 
 ```
-wdn 1.0.0
+wdn 1.0.1
 
 ▶ Components
-  wdn                      1.0.0  the CLI      1a19fac
-  wdnwebui                 0.9.2  host app     8110a73
-  wdnav                    0.5.2  SDK          4582da6
-  wdnai                    0.7.0  SDK          7858526
-  wdndds                   0.9.0  SDK          062942b
-  wdnhid                   0.1.0  SDK          285d26d
-  wdnapps_video_analyzer   0.1.0  card plugin  342ffda
-  wdnapps_hdmi_processor   0.1.0  card plugin  d119333
-  wdnapps_audio_chat       0.1.0  card plugin  7aedab2
-  wdnapps_media_generator  0.1.0  card plugin  aa6d0d2
+  wdn                      1.0.1  the CLI      1a19fac
+  wdnwebui                 0.9.3  host app     8110a73
+  wdnav                    0.5.3  SDK          4582da6
+  wdnai                    0.7.1  SDK          7858526
+  wdndds                   0.9.1  SDK          062942b
+  wdnhid                   0.1.1  SDK          285d26d
+  wdnapps_video_analyzer   0.1.1  card plugin  342ffda
+  wdnapps_hdmi_processor   0.1.1  card plugin  d119333
+  wdnapps_audio_chat       0.1.1  card plugin  7aedab2
+  wdnapps_media_generator  0.1.1  card plugin  aa6d0d2
 ```
 
 The list is **not hard-coded** — it is read from `packages.conf`, so a package that
 upstream adds shows up here without touching the CLI. The version of a package comes
 from the **installed distribution metadata** (what `import` reports) and the short
-commit next to it tells the two apart: the four card plugins all sit at `0.1.0`, but
+commit next to it tells the two apart: the four card plugins all sit at `0.1.1`, but
 they are not the same build.
 
 When the sources were pulled but the package was not reinstalled, the installed version
 and the version declared by the source tree differ — then both are shown:
 
 ```
-  wdnav                    0.5.2  SDK          ff92123  (the source tree declares 9.9.9)
+  wdnav                    0.5.3  SDK          ff92123  (the source tree declares 9.9.9)
 ```
 
 A package that is listed but not cloned is reported as `(not installed)`; one that is

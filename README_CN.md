@@ -213,29 +213,29 @@ manifest 里的 `spec_factory` 如果装好的 `wdnai` 不认识，会被报成�
 `wdn version` 列出装机的**每一个组件**的版本 —— CLI 自己、宿主应用、四个 SDK 和各个卡片插件：
 
 ```
-wdn 1.0.0
+wdn 1.0.1
 
 ▶ Components
-  wdn                      1.0.0  the CLI      1a19fac
-  wdnwebui                 0.9.2  host app     8110a73
-  wdnav                    0.5.2  SDK          4582da6
-  wdnai                    0.7.0  SDK          7858526
-  wdndds                   0.9.0  SDK          062942b
-  wdnhid                   0.1.0  SDK          285d26d
-  wdnapps_video_analyzer   0.1.0  card plugin  342ffda
-  wdnapps_hdmi_processor   0.1.0  card plugin  d119333
-  wdnapps_audio_chat       0.1.0  card plugin  7aedab2
-  wdnapps_media_generator  0.1.0  card plugin  aa6d0d2
+  wdn                      1.0.1  the CLI      1a19fac
+  wdnwebui                 0.9.3  host app     8110a73
+  wdnav                    0.5.3  SDK          4582da6
+  wdnai                    0.7.1  SDK          7858526
+  wdndds                   0.9.1  SDK          062942b
+  wdnhid                   0.1.1  SDK          285d26d
+  wdnapps_video_analyzer   0.1.1  card plugin  342ffda
+  wdnapps_hdmi_processor   0.1.1  card plugin  d119333
+  wdnapps_audio_chat       0.1.1  card plugin  7aedab2
+  wdnapps_media_generator  0.1.1  card plugin  aa6d0d2
 ```
 
 这份清单**没有写死**：它是从 `packages.conf` 读出来的，所以上游新加的包不用改 CLI 也会出现在这里。
 包的版本取自**装好的发行包元数据**（也就是 `import` 看到的那个版本），旁边的短 commit
-用来把它们区分开：四个卡片插件都是 `0.1.0`，但并不是同一份代码。
+用来把它们区分开：四个卡片插件都是 `0.1.1`，但并不是同一份代码。
 
 源码拉下来了、包却没重装时，装好的版本和源码里声明的版本会对不上 —— 这时两个都列出来：
 
 ```
-  wdnav                    0.5.2  SDK          ff92123  (the source tree declares 9.9.9)
+  wdnav                    0.5.3  SDK          ff92123  (the source tree declares 9.9.9)
 ```
 
 清单里有、但还没克隆下来的包会标成 `(not installed)`；装好了、但源码目录没了的包会标成
