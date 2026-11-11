@@ -160,7 +160,7 @@ wdn update      # update every downloaded repo to the latest on the source site,
 wdn status      # show each repo's commit / remote, the venv state and the models
 wdn start 8080  # start the wdnwebui service in the background, listening on port 8080
 wdn stop        # stop the wdnwebui service
-wdn version     # version number
+wdn version     # the version of every component: the CLI, the host app, the SDKs, the card plugins
 ```
 
 ### `wdn start` / `wdn stop` — run the web service
@@ -226,6 +226,43 @@ The last column is the id of the worker manifest found in the model folder — t
 id the compute page serves the model under. A manifest whose `spec_factory` is unknown
 to the installed `wdnai` is reported as broken, and a folder in the model root that no
 model claims is listed at the end.
+
+### `wdn version` — what exactly is installed
+
+`wdn version` lists the version of **every component** of the installation — the CLI
+itself, the host app, the four SDKs and the card plugins:
+
+```
+wdn 1.0.0
+
+▶ Components
+  wdn                      1.0.0  the CLI      1a19fac
+  wdnwebui                 0.9.2  host app     8110a73
+  wdnav                    0.5.2  SDK          4582da6
+  wdnai                    0.7.0  SDK          7858526
+  wdndds                   0.9.0  SDK          062942b
+  wdnhid                   0.1.0  SDK          285d26d
+  wdnapps_video_analyzer   0.1.0  card plugin  342ffda
+  wdnapps_hdmi_processor   0.1.0  card plugin  d119333
+  wdnapps_audio_chat       0.1.0  card plugin  7aedab2
+  wdnapps_media_generator  0.1.0  card plugin  aa6d0d2
+```
+
+The list is **not hard-coded** — it is read from `packages.conf`, so a package that
+upstream adds shows up here without touching the CLI. The version of a package comes
+from the **installed distribution metadata** (what `import` reports) and the short
+commit next to it tells the two apart: the four card plugins all sit at `0.1.0`, but
+they are not the same build.
+
+When the sources were pulled but the package was not reinstalled, the installed version
+and the version declared by the source tree differ — then both are shown:
+
+```
+  wdnav                    0.5.2  SDK          ff92123  (the source tree declares 9.9.9)
+```
+
+A package that is listed but not cloned is reported as `(not installed)`; one that is
+installed but whose checkout is gone is reported as `(no source tree)`.
 
 ### `wdn update` does three things
 

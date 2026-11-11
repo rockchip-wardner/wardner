@@ -13,7 +13,8 @@
 #   wdn start      start the wdnwebui service in the background and listen
 #                  on the given port (default 8000)
 #   wdn stop       stop the wdnwebui service
-#   wdn version    print the version
+#   wdn version    print the version of every component (the CLI, the host
+#                  app, the SDKs and the card plugins)
 #
 # Two layers:
 #   * this file (bash) only finds itself + finds the python of the venv,

@@ -14,7 +14,8 @@ Subcommands
   start     start the wdnwebui service in the background and listen on the
             given port (default 8000)
   stop      stop the wdnwebui service
-  version   print the version
+  version   print the version of every component (the CLI, the host app, the
+            SDKs and the card plugins)
 
 Runs with the **venv python** (see bin/wdn)
 --------------------------------------------
@@ -1014,14 +1015,122 @@ def _models_section() -> None:
 
 # ---------------------------------------------------------------------------
 # Subcommand: version
+#
+# `wdn version` answers one question: **what exactly is installed on this
+# board?**
+#
+# The installation is not one program. It is the CLI, the host app and one
+# clone per package of packages.conf — the four SDKs and the card plugins
+# — and every one of them carries its own version number. A version that
+# only lives in the source of the CLI says nothing about the state of the
+# board, so every component is listed here.
+#
+# The version of a package is read from the **installed distribution
+# metadata** (what `import` reports) and not from the source tree: after
+# an update that pulled the sources but did not reinstall the package the
+# two differ, and then the installed one is the one that is really
+# running. When they differ, both are shown.
 # ---------------------------------------------------------------------------
 
+#: The role of a package of packages.conf. The SDKs and the card plugins
+#: are listed the same way, the name prefix is what tells them apart —
+#: the same rule that `doctor` uses to find the plugins.
+PLUGIN_PREFIX = "wdnapps"
+
+
+def _webapp_version(hrepo: Path) -> str:
+    """The version of the host app — ``app/__init__.py`` declares it.
+
+    The CLI deliberately does not import the app: importing it pulls in
+    FastAPI and the whole config stack, and `wdn version` has to work on
+    a half-installed board — which is exactly when an operator needs to
+    know which version is there.
+    """
+    try:
+        text = (hrepo / "app" / "__init__.py").read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    m = re.search(r"""^\s*__version__\s*=\s*["']([^"']+)["']""", text, re.M)
+    return m.group(1) if m else ""
+
+
+def _commit_of(repo: Path) -> str:
+    """The short commit of a checkout, "" when it is not a git repo."""
+    if not (repo / ".git").is_dir():
+        return ""
+    return short(rev(repo))
+
+
 def cmd_version(args: argparse.Namespace) -> int:
+    wrepo = wardner_repo()
+    hrepo = host_repo()
+    pkgs = read_packages_conf(wrepo)
+
     print(f"wdn {VERSION}")
-    print(f"  install root  {wardner_home()}")
-    print(f"  installer     {wardner_repo()}")
-    print(f"  host app      {host_repo()}")
-    print(f"  venv python   {venv_python()}")
+
+    step("Components")
+
+    # name, version, role, commit (dim), alert (yellow)
+    rows: list[tuple[str, str, str, str, str]] = [
+        ("wdn", VERSION, "the CLI", _commit_of(wrepo), ""),
+        (hrepo.name, _webapp_version(hrepo) or "—", "host app",
+         _commit_of(hrepo), ""),
+    ]
+
+    # The SDKs first and the card plugins after them — the order
+    # packages.conf documents, and the order the packages are installed
+    # in (the plugins import the SDKs).
+    groups = (
+        [p for p in pkgs if not p[0].startswith(PLUGIN_PREFIX)],
+        [p for p in pkgs if p[0].startswith(PLUGIN_PREFIX)],
+    )
+    for group in groups:
+        for pkg, _ in group:
+            pdir = venv_src() / pkg
+            role = "card plugin" if pkg.startswith(PLUGIN_PREFIX) else "SDK"
+            installed = _installed_version(pkg)
+            source = _source_version(pdir)
+
+            # The installed version is the one that is really running; the
+            # source tree only says what the checkout declares. The two
+            # are compared here and each mismatch is named explicitly — a
+            # bare version number does not say which of the two it is.
+            alert = ""
+            if not installed:
+                version = source or "—"
+                alert = "(not installed)"
+            else:
+                version = installed
+                if source and source != installed:
+                    alert = f"(the source tree declares {source})"
+                elif not (pdir / ".git").is_dir():
+                    alert = "(no source tree)"
+            rows.append((pkg, version, role, _commit_of(pdir), alert))
+
+    w_name = max(len(r[0]) for r in rows)
+    w_ver = max(len(r[1]) for r in rows)
+    w_role = max(len(r[2]) for r in rows)
+    for name, ver, role, commit, alert in rows:
+        line = f"  {name:<{w_name}}  {ver:<{w_ver}}  {role:<{w_role}}"
+        if commit:
+            line += f"  {C_DIM}{commit}{C_RST}"
+        if alert:
+            line += f"  {C_YEL}{alert}{C_RST}"
+        print(line.rstrip())
+
+    step("Paths")
+    ok(f"install root  {wardner_home()}")
+    ok(f"installer     {wrepo}")
+    ok(f"host app      {hrepo}")
+    vpy = venv_python()
+    if vpy.is_file():
+        pyver = subprocess.run(
+            [str(vpy), "-c", "import sys;print('%d.%d.%d' % sys.version_info[:3])"],
+            capture_output=True, text=True,
+        ).stdout.strip()
+        ok(f"venv python   {vpy}" + (f"  (Python {pyver})" if pyver else ""))
+    else:
+        warn(f"venv python   {vpy}  (not installed yet)")
     return 0
 
 
@@ -2681,7 +2790,7 @@ def build_parser() -> argparse.ArgumentParser:
                     help="also compare the local HEAD with the tip of the remote (needs the network)")
     dr.set_defaults(func=cmd_doctor)
 
-    vn = sub.add_parser("version", help="print the version")
+    vn = sub.add_parser("version", help="print the version of every component: the CLI, the host app, the SDKs and the card plugins")
     vn.set_defaults(func=cmd_version)
 
     stt = sub.add_parser(
