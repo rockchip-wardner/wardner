@@ -24,6 +24,26 @@ tracks `origin`, so a bare `git pull` / `git push` operates on the primary repo.
 Pulling fresh code goes to the intranet primary only — pulling from GitHub
 fetches "history that has already been released" and forks the local branch.
 
+🚦 **Always ask the user before pushing (2026-11-12).**
+
+A local `git commit` needs no permission; **`git push` always needs it** — push
+only after the user says yes:
+
+> "Shall I push these N commits of wardner to the intranet primary
+> (10.10.10.10) and to GitHub?"
+
+**Never push as a matter of course.** Reasons:
+
+* Pushing is an outward-facing action — the GitHub mirror is public and
+  internationally visible, and it cannot be taken back.
+* The user may still have work in progress locally; pushing early publishes
+  half-finished work as "the latest".
+* One approval covers only the repository and the commits that were named in
+  the question — do not roll it over to other repos.
+
+The order itself is unchanged (intranet first, then GitHub); it just gains an
+"ask first" step.
+
 ## Commit message policy (2026-11-11)
 
 **Commit messages must be in English.**
