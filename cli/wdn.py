@@ -1170,6 +1170,70 @@ def _log_file() -> Path:
     return wardner_home() / "logs" / "wdnwebui.log"
 
 
+def _invoking_user() -> Optional[tuple[int, int]]:
+    """(uid, gid) of the user who invoked ``sudo`` — ``None`` when not root.
+
+    ``sudo`` exports ``SUDO_UID`` / ``SUDO_GID``.  When the CLI runs as
+    root directly (no sudo) there is nobody to hand the files back to,
+    so the caller falls back to leaving them alone.
+    """
+    if os.geteuid() != 0:
+        return None
+    try:
+        return int(os.environ["SUDO_UID"]), int(os.environ["SUDO_GID"])
+    except (KeyError, ValueError):
+        return None
+
+
+def _owner_hint() -> str:
+    """``uid:gid`` to put into a ``sudo chown`` hint.
+
+    When the CLI itself runs as root the plain ``os.getuid()`` is 0 —
+    that is exactly the ownership the user is trying to get rid of — so
+    the pre-sudo user wins whenever sudo exported one.
+    """
+    owner = _invoking_user()
+    if owner is not None:
+        return f"{owner[0]}:{owner[1]}"
+    return f"{os.getuid()}:{os.getgid()}"
+
+
+def _own_as_invoker(path: Path, mode: int = 0o664) -> None:
+    """Give a file (or a directory) back to the user who invoked sudo.
+
+    ``sudo wdn start`` runs this CLI as root, so the log and the pid
+    file it creates would be root-owned.  That breaks the plain-user
+    workflow in two ways:
+
+    * ``wdn start`` opens the log in **append** mode — a root-owned
+      0644 file is EACCES for the normal user, so the next plain
+      ``wdn start`` (or ``wdn update``, which reads it) fails on the
+      very file the previous run created;
+    * the normal user can no longer rewrite the pid file, so ``wdn
+      stop`` cannot update it.
+
+    Hand both back to the pre-sudo user and keep them group-writable,
+    so a group deployment keeps working too.  A missing file is not an
+    error — the caller chowns after creating it as well.
+
+    ``mode`` is the permission set applied after the chown: 0664 for a
+    file, 0775 for a directory (a directory needs the execute bit to
+    stay traversable, so the file mode would break it).
+    """
+    owner = _invoking_user()
+    if owner is None or not path.exists():
+        return
+    try:
+        os.chown(path, owner[0], owner[1])
+    except OSError as exc:
+        warn(f"could not hand {path} back to the invoking user: {exc}")
+        return
+    try:
+        os.chmod(path, mode)
+    except OSError:
+        pass
+
+
 def _pid_alive(pid: int) -> bool:
     """Is the pid alive? A process we may not signal still counts."""
     try:
@@ -1332,6 +1396,18 @@ def _ppid_of(pid: int) -> int | None:
     return None
 
 
+def _proc_uid(pid: int) -> int | None:
+    """The uid a process runs as, or None when it is gone."""
+    try:
+        with open(f"/proc/{pid}/status") as f:
+            for line in f:
+                if line.startswith("Uid:"):
+                    return int(line.split()[1])
+    except (OSError, ValueError):
+        return None
+    return None
+
+
 def _is_repo_process(pid: int) -> bool:
     """Is the pid one of this repo's webui processes?
 
@@ -1438,10 +1514,18 @@ def _terminate_group(
     tree = [pid] + [p for p in _descendant_pids(pid)
                     if "compute_worker.py" not in _proc_cmdline(p)]
 
+    # Whether the signal actually reached somebody. A service that runs as
+    # root (`sudo wdn start`) cannot be signalled by a normal user — every
+    # kill is refused with EPERM — and waiting out the whole grace period
+    # for a process that will never die helps nobody.
+    delivered = False
+
     def _signal_tree(sig: int) -> None:
+        nonlocal delivered
         if group_ok:
             try:
                 os.killpg(pgid, sig)
+                delivered = True
                 return
             except (ProcessLookupError, PermissionError):
                 pass
@@ -1449,10 +1533,16 @@ def _terminate_group(
         for target in tree:
             try:
                 os.kill(target, sig)
+                delivered = True
             except (ProcessLookupError, PermissionError):
                 pass
 
     _signal_tree(signal.SIGTERM)
+
+    # Nothing could be signalled at all → the process is out of reach
+    # (root-owned service, normal user). Say so instead of waiting.
+    if not delivered and any(_pid_alive(p) for p in tree):
+        return False
 
     deadline = time.time() + grace
     while time.time() < deadline:
@@ -1484,9 +1574,17 @@ def _terminate_group(
             pass
     time.sleep(0.5)
 
+    # The processes are the source of truth — the port check alone is not
+    # enough: `ss -tlnp` does not show the owner of a root socket to a
+    # normal user (the pid column is simply missing), so a service that
+    # runs as root (`sudo wdn start`) would look "free" while it is still
+    # alive — and the plain user cannot signal it either, so the kill
+    # above was refused. Reporting that as "stopped" would be a lie.
+    if any(_pid_alive(p) for p in tree):
+        return False
     if port:
         return _port_holder(port) is None
-    return not any(_pid_alive(p) for p in tree)
+    return True
 
 
 def _ports_of_pid(pid: int) -> list[int]:
@@ -1589,9 +1687,25 @@ def cmd_start(args: argparse.Namespace) -> int:
 
     log = _log_file()
     log.parent.mkdir(parents=True, exist_ok=True)
+    # A previous `sudo wdn start` may have left a root-owned log behind:
+    # take it back before opening it in append mode (EACCES otherwise).
+    # The directory too — a root-owned logs/ keeps the plain user from
+    # replacing the file even when the file itself is theirs again.
+    _own_as_invoker(log.parent, 0o775)
+    _own_as_invoker(log)
     banner = (f"===== wdn start {time.strftime('%Y-%m-%d %H:%M:%S')} "
               f": {' '.join(cmd)} =====\n")
-    with open(log, "ab", buffering=0) as fh:
+    try:
+        fh = open(log, "ab", buffering=0)
+    except PermissionError:
+        bad(f"cannot write the log file {log} — it belongs to another user")
+        note("  it was probably created by an earlier `sudo wdn start`")
+        note(f"  fix: sudo chown {_owner_hint()} {log}")
+        return 1
+    with fh:
+        # The file may have just been created — hand it back to the user
+        # that invoked sudo so a later plain `wdn start` can append to it.
+        _own_as_invoker(log)
         fh.write(banner.encode())
         proc = subprocess.Popen(
             cmd,
@@ -1630,13 +1744,25 @@ def cmd_start(args: argparse.Namespace) -> int:
 
     # --- record the pid ---
     _service_dir().mkdir(parents=True, exist_ok=True)
-    _pid_file().write_text(json.dumps({
-        "pid": proc.pid,
-        "port": port,
-        "started": time.strftime("%Y-%m-%dT%H:%M:%S"),
-        "log": str(log),
-        "cmd": " ".join(cmd),
-    }, indent=2) + "\n")
+    # The pid file lives in run/ — a root-owned directory would keep the
+    # plain user from unlinking it in `wdn stop` (unlink needs write
+    # permission on the *directory*, not on the file).
+    _own_as_invoker(_service_dir(), 0o775)
+    _own_as_invoker(_pid_file())      # a stale root-owned pid file
+    try:
+        _pid_file().write_text(json.dumps({
+            "pid": proc.pid,
+            "port": port,
+            "started": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "log": str(log),
+            "cmd": " ".join(cmd),
+        }, indent=2) + "\n")
+    except PermissionError:
+        bad(f"cannot write the pid file {_pid_file()} — it belongs to another user")
+        note("  it was probably created by an earlier `sudo wdn start`")
+        note(f"  fix: sudo chown {_owner_hint()} {_pid_file()}")
+        return 1
+    _own_as_invoker(_pid_file())      # just written → hand it back
 
     ok(f"wdnwebui started (pid {proc.pid})")
     _print_service_urls(port)
@@ -1659,8 +1785,16 @@ def cmd_stop(args: argparse.Namespace) -> int:
             raw = state.get("port")
             port = int(raw) if raw else None
             targets.append((pid, f"wdnwebui (port {port or '?'})", True, port))
-        # the pid file goes either way — a stale one is worse than none
-        _pid_file().unlink(missing_ok=True)
+        # A **stale** pid file is worse than none → drop it. A **live** one
+        # is kept: the service may run as root (it was started with
+        # `sudo wdn start`), and a plain user cannot signal that process —
+        # the file is what lets `sudo wdn stop` find it afterwards.
+        else:
+            try:
+                _pid_file().unlink(missing_ok=True)
+            except PermissionError:
+                note(f"could not remove {_pid_file()} — it belongs to another user")
+                note(f"  fix: sudo rm {_pid_file()}")
 
     if not targets:
         # not started by `wdn start` — look for a webui of this repo.
@@ -1689,10 +1823,19 @@ def cmd_stop(args: argparse.Namespace) -> int:
             port = ports[0] if ports else None
         if _terminate_group(pid, port, exclusive_group=exclusive):
             ok(f"stopped {label} (pid {pid})")
+            # the pid file is stale now → drop it, so `wdn start` does not
+            # find a pid that is already gone
+            try:
+                _pid_file().unlink(missing_ok=True)
+            except PermissionError:
+                pass
             if port:
                 ok(f"port {port} is free")
         else:
             bad(f"could not stop {label} (pid {pid}) — kill it manually")
+            if _proc_uid(pid) == 0:
+                note("  the service runs as root — stop it with:  sudo wdn stop")
+                note("  (the pid file was kept, so the sudo run finds it)")
             if port:
                 holder = _port_holder(port)
                 bad(f"port {port} is still held by pid {holder}"
@@ -2771,7 +2914,32 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="wdn",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
         description="the wardner command line tool: update / inspect the wdnwebui installation on this board.",
+        epilog=(
+            "permissions\n"
+            "  The service normally runs as the user that started it. Two device\n"
+            "  permissions need extra work on some boards:\n"
+            "\n"
+            "    * the USB HID gadget (configfs) — run.sh asks for it with `sudo -n`\n"
+            "      on every start. The clean way is a NOPASSWD rule instead of running\n"
+            "      the whole service as root:\n"
+            "        /etc/sudoers.d/wdnwebui-usb-hid\n"
+            "          <user> ALL=(root) NOPASSWD: <repo>/scripts/setup_usb_hid_gadget.sh\n"
+            "\n"
+            "    * the HDMI-IN capture (/dev/video0, group `video`) and the HID nodes\n"
+            "      (/dev/hidgN) — add the service user to those groups, or install the\n"
+            "      udev rules once:\n"
+            "        sudo bash <repo>/scripts/install_usb_hid_perms.sh\n"
+            "        sudo usermod -aG video <user>      # then log in again\n"
+            "\n"
+            "  If the service cannot open those nodes and there is no other way to\n"
+            "  grant the permissions, `sudo wdn start` works as a fallback: the log\n"
+            "  and the pid file are handed back to the invoking user, so the log\n"
+            "  stays writable and `wdn update` keeps working afterwards. The\n"
+            "  service itself then runs as root, so stopping it needs\n"
+            "  `sudo wdn stop` as well.\n"
+        ),
     )
     p.add_argument("--version", action="version", version=f"wdn {VERSION}")
     sub = p.add_subparsers(dest="cmd")
@@ -2795,7 +2963,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     stt = sub.add_parser(
         "start",
-        help="start the wdnwebui service in the background and listen on the given port",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        help="start the wdnwebui service in the background and listen on the given port "
+             "(use `sudo wdn start` when the service cannot open the USB HID / HDMI-IN nodes)",
+        epilog=(
+            "permissions\n"
+            "  The service runs as the user that started it. If it cannot open\n"
+            "  the USB HID gadget (/dev/hidgN) or the HDMI-IN capture node\n"
+            "  (/dev/video0), try `sudo wdn start`: the log and the pid file are\n"
+            "  handed back to the user that ran sudo, so the log stays writable\n"
+            "  and `wdn update` keeps working. The service then runs as root,\n"
+            "  so stopping it needs `sudo wdn stop` as well.\n"
+        ),
     )
     stt.add_argument("port", nargs="?", type=int, default=DEFAULT_PORT,
                      help=f"the TCP port to listen on (default: {DEFAULT_PORT})")
