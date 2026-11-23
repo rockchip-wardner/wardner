@@ -57,6 +57,7 @@ import re
 import shutil
 import signal
 import socket
+import ssl
 import subprocess
 import sys
 import time
@@ -1156,6 +1157,127 @@ def cmd_version(args: argparse.Namespace) -> int:
 
 DEFAULT_PORT = 8000
 
+# ---------------------------------------------------------------------------
+# TLS
+#
+# Port 8000 is the **production HTTPS** entry (see wdnwebui/AGENTS.md and
+# docs/PORT_8000_HTTPS_ONLY_MIGRATION.md): the app terminates TLS inside
+# uvicorn, and wdnwebui/run.py *refuses* to start in plaintext on that port.
+# The guard is deliberate — run.py reaps whatever holds the port before it
+# binds, so a plaintext start would swap the production HTTPS entry for a
+# plaintext one without anybody noticing.
+#
+# ⇒ `wdn start` has to start the service the way production does: with the
+# certificate from the well-known TLS directory. The paths are the ones
+# install_autostart.sh bakes into the systemd unit, so both entry points
+# serve the same certificate.
+# ---------------------------------------------------------------------------
+
+PRODUCTION_HTTPS_PORT = 8000      # keep in sync with wdnwebui/run.py
+TLS_DIR_ENV = "WDNWEBUI_TLS_DIR"
+# ⚠️ The default is **hardcoded**, not Path.home()-derived, for two reasons:
+#   * the certificate must sit where wdnwebui/scripts/gen_tls_ca.sh and
+#     wdnwebui/install_autostart.sh put it — a different path would mean a
+#     different certificate than the systemd unit serves;
+#   * Path.home() returns /root under `sudo wdn start`, so the CLI would
+#     look for the certificate in the wrong place exactly when the service
+#     runs as root.
+DEFAULT_TLS_DIR = Path("/home/rockchip/.config/wdnwebui/tls")
+
+
+class _TlsPlan:
+    """How one start talks to the app: the scheme plus the certificate.
+
+    ``scheme`` is "https" when the service serves TLS and "http" otherwise.
+    ``cafile`` is the CA root the local readiness probe trusts.
+    """
+
+    __slots__ = ("scheme", "certfile", "keyfile", "cafile")
+
+    def __init__(self, scheme: str, certfile: Path | None = None,
+                 keyfile: Path | None = None, cafile: Path | None = None):
+        self.scheme = scheme
+        self.certfile = certfile
+        self.keyfile = keyfile
+        self.cafile = cafile
+
+    @property
+    def tls(self) -> bool:
+        return self.scheme == "https"
+
+
+def _tls_dir() -> Path:
+    """The directory holding the TLS material (cert / key / CA root)."""
+    env = os.environ.get(TLS_DIR_ENV, "").strip()
+    return Path(env).expanduser() if env else DEFAULT_TLS_DIR
+
+
+def _default_tls_files() -> tuple[Path, Path]:
+    """(cert, key) of the production certificate."""
+    d = _tls_dir()
+    return d / "cert.pem", d / "key.pem"
+
+
+def _resolve_start_tls(args: argparse.Namespace, port: int) -> _TlsPlan | None:
+    """Decide the scheme of this start; print why when it must not start.
+
+    Returns None when the start must not go ahead (the reason is printed).
+
+    The rules mirror the guard in wdnwebui/run.py:
+
+      * --allow-plaintext            -> plaintext, whatever the port
+      * --ssl-certfile/--ssl-keyfile  -> HTTPS with that certificate
+      * the production port 8000      -> HTTPS with the default certificate
+      * any other port                -> plaintext (run.py allows it there)
+    """
+    cert = getattr(args, "ssl_certfile", None)
+    key = getattr(args, "ssl_keyfile", None)
+
+    if cert or key:
+        if not (cert and key):
+            bad("--ssl-certfile and --ssl-keyfile must be given **together**")
+            note("  one of them alone cannot enable TLS — uvicorn would "
+                 "silently fall back to plaintext")
+            return None
+        cert_p, key_p = Path(cert).expanduser(), Path(key).expanduser()
+        for label, p in (("--ssl-certfile", cert_p), ("--ssl-keyfile", key_p)):
+            if not p.is_file():
+                bad(f"{label} does not exist: {p}")
+                return None
+            if not os.access(p, os.R_OK):
+                bad(f"{label} is not readable: {p}")
+                return None
+        return _TlsPlan("https", cert_p, key_p, _tls_dir() / "ca.pem")
+
+    if getattr(args, "allow_plaintext", False):
+        if port == PRODUCTION_HTTPS_PORT:
+            warn(f"starting in plaintext on port {port} — that port is the "
+                 f"production HTTPS entry")
+            note("  the browser and every client must then speak http://")
+        return _TlsPlan("http")
+
+    if port != PRODUCTION_HTTPS_PORT:
+        # run.py allows plaintext on every other port.
+        return _TlsPlan("http")
+
+    # The production port: HTTPS with the well-known certificate.
+    cert_p, key_p = _default_tls_files()
+    if not (cert_p.is_file() and key_p.is_file()):
+        bad(f"the TLS certificate for the production port {port} is missing:")
+        note(f"  {cert_p}")
+        note(f"  {key_p}")
+        note(f"port {port} only speaks HTTPS — the app refuses to start in "
+             f"plaintext there")
+        note(f"  generate the certificate once:")
+        note(f"    bash {host_repo() / 'scripts' / 'gen_tls_ca.sh'} {_lan_ip()}")
+        note(f"  or serve on another port (plaintext is allowed there):")
+        note(f"    wdn start 8001")
+        note(f"  or force plaintext on {port} (not recommended):")
+        note(f"    wdn start --allow-plaintext")
+        return None
+
+    return _TlsPlan("https", cert_p, key_p, _tls_dir() / "ca.pem")
+
 
 def _service_dir() -> Path:
     """<wardner_home>/run — the pid file lives here."""
@@ -1272,17 +1394,43 @@ def _port_holder(port: int) -> int | None:
     return int(m.group(1)) if m else None
 
 
-def _http_ok(port: int, timeout: float = 2.0) -> bool:
+def _tls_probe_context(cafile: Path | None) -> ssl.SSLContext:
+    """The SSL context of the local readiness probe.
+
+    The leaf certificate is issued by the board's private CA, so the probe
+    trusts ``ca.pem`` when it is there.  When it is missing the probe has
+    to keep working — it asks "did the app boot", not "is the certificate
+    valid" — so it falls back to an unverified context.  This is a
+    **loopback** probe; the certificate's own health is the job of
+    wdnwebui/scripts/tls_cert_check.sh, not of the CLI.
+    """
+    if cafile and cafile.is_file():
+        try:
+            return ssl.create_default_context(cafile=str(cafile))
+        except (ssl.SSLError, OSError):
+            pass
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
+def _http_ok(port: int, timeout: float = 2.0, scheme: str = "http",
+             cafile: Path | None = None) -> bool:
     """GET /health on the local port — the real readiness probe.
 
     "the port is bound" is not enough: uvicorn binds before the app has
     finished booting, and a request that comes back 200 proves the whole
     stack (config, the app, the static files) is actually serving.
+
+    The scheme matters: on 8000 the app serves **HTTPS**, and an http://
+    request against a TLS listener dies in the handshake — the probe would
+    report a perfectly healthy service as dead.
     """
+    ctx = _tls_probe_context(cafile) if scheme == "https" else None
+    req = urllib.request.Request(f"{scheme}://127.0.0.1:{port}/health")
     try:
-        with urllib.request.urlopen(
-            f"http://127.0.0.1:{port}/health", timeout=timeout
-        ) as resp:
+        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
             return resp.status == 200
     except Exception:
         return False
@@ -1621,11 +1769,11 @@ def _print_log_tail(log: Path, lines: int = 20) -> None:
         print(f"    {C_DIM}{line}{C_RST}")
 
 
-def _print_service_urls(port: int) -> None:
+def _print_service_urls(port: int, scheme: str = "http") -> None:
     ip = _lan_ip()
-    ok(f"the web UI is listening on http://{ip}:{port}/")
+    ok(f"the web UI is listening on {scheme}://{ip}:{port}/")
     if ip != "127.0.0.1":
-        note(f"also reachable at http://127.0.0.1:{port}/")
+        note(f"also reachable at {scheme}://127.0.0.1:{port}/")
 
 
 def cmd_start(args: argparse.Namespace) -> int:
@@ -1644,7 +1792,14 @@ def cmd_start(args: argparse.Namespace) -> int:
         bad(f"the host app is missing: {entry}")
         return 1
 
-    step(f"starting wdnwebui on port {port}")
+    # --- TLS or plaintext? ---
+    # Port 8000 is the production HTTPS entry and run.py refuses to start
+    # in plaintext there ⇒ resolve the scheme *before* anything is spawned.
+    plan = _resolve_start_tls(args, port)
+    if plan is None:
+        return 2
+
+    step(f"starting wdnwebui on port {port} ({plan.scheme})")
 
     # --- is it already running? ---
     state = _read_pid_file()
@@ -1652,9 +1807,11 @@ def cmd_start(args: argparse.Namespace) -> int:
         pid = int(state.get("pid") or 0)
         if pid and _pid_alive(pid):
             running_port = state.get("port", port)
+            running_scheme = state.get("scheme") or (
+                "https" if running_port == PRODUCTION_HTTPS_PORT else "http")
             if running_port == port:
                 ok(f"wdnwebui is already running on port {port} (pid {pid})")
-                _print_service_urls(port)
+                _print_service_urls(port, running_scheme)
                 return 0
             bad(f"wdnwebui is already running on port {running_port} (pid {pid})")
             note("stop it first:  wdn stop")
@@ -1684,6 +1841,16 @@ def cmd_start(args: argparse.Namespace) -> int:
         cmd = ["bash", str(hrepo / "run.sh"), "--port", str(port)]
     else:
         cmd = [str(venv_python()), str(entry), "--port", str(port)]
+
+    # run.sh forwards "$@" to run.py, so the TLS flags reach the app either
+    # way. On 8000 the guard in run.py refuses a plaintext start — passing
+    # the certificate is what makes the start legal, and --allow-plaintext
+    # is the explicit opt-out.
+    if plan.tls:
+        cmd += ["--ssl-certfile", str(plan.certfile),
+                "--ssl-keyfile", str(plan.keyfile)]
+    elif port == PRODUCTION_HTTPS_PORT:
+        cmd += ["--allow-plaintext"]
 
     log = _log_file()
     log.parent.mkdir(parents=True, exist_ok=True)
@@ -1723,7 +1890,7 @@ def cmd_start(args: argparse.Namespace) -> int:
     while time.time() < deadline:
         if proc.poll() is not None:
             break
-        if _http_ok(port):
+        if _http_ok(port, scheme=plan.scheme, cafile=plan.cafile):
             healthy = True
             break
         time.sleep(0.5)
@@ -1753,6 +1920,7 @@ def cmd_start(args: argparse.Namespace) -> int:
         _pid_file().write_text(json.dumps({
             "pid": proc.pid,
             "port": port,
+            "scheme": plan.scheme,
             "started": time.strftime("%Y-%m-%dT%H:%M:%S"),
             "log": str(log),
             "cmd": " ".join(cmd),
@@ -1765,7 +1933,7 @@ def cmd_start(args: argparse.Namespace) -> int:
     _own_as_invoker(_pid_file())      # just written → hand it back
 
     ok(f"wdnwebui started (pid {proc.pid})")
-    _print_service_urls(port)
+    _print_service_urls(port, plan.scheme)
     note(f"the log   {log}")
     note("stop it with:  wdn stop")
     return 0
@@ -2974,6 +3142,16 @@ def build_parser() -> argparse.ArgumentParser:
             "  handed back to the user that ran sudo, so the log stays writable\n"
             "  and `wdn update` keeps working. The service then runs as root,\n"
             "  so stopping it needs `sudo wdn stop` as well.\n"
+            "\n"
+            "TLS\n"
+            f"  Port {PRODUCTION_HTTPS_PORT} is the production HTTPS entry: the app\n"
+            "  serves TLS and refuses to start in plaintext there. `wdn start`\n"
+            "  therefore serves HTTPS with the certificate of\n"
+            "  <tls dir>/cert.pem + <tls dir>/key.pem (the tls dir is\n"
+            f"  ${{{TLS_DIR_ENV}}} or {DEFAULT_TLS_DIR}).\n"
+            "  Every other port is plain HTTP. Use --ssl-certfile/--ssl-keyfile\n"
+            "  to serve HTTPS elsewhere, --allow-plaintext to force HTTP on\n"
+            f"  {PRODUCTION_HTTPS_PORT} anyway.\n"
         ),
     )
     stt.add_argument("port", nargs="?", type=int, default=DEFAULT_PORT,
@@ -2981,6 +3159,15 @@ def build_parser() -> argparse.ArgumentParser:
     stt.add_argument("--timeout", type=float, default=60.0,
                      help="how long to wait for the service to answer on /health "
                           "(default: 60s)")
+    stt.add_argument("--ssl-certfile", default=None,
+                     help="the TLS certificate to serve HTTPS with "
+                          f"(default: <tls dir>/cert.pem on port {PRODUCTION_HTTPS_PORT})")
+    stt.add_argument("--ssl-keyfile", default=None,
+                     help="the TLS private key — must be given together with "
+                          "--ssl-certfile")
+    stt.add_argument("--allow-plaintext", action="store_true",
+                     help=f"start in plaintext even on port {PRODUCTION_HTTPS_PORT} "
+                          "(not recommended — that port is the HTTPS entry)")
     stt.set_defaults(func=cmd_start)
 
     spt = sub.add_parser("stop", help="stop the wdnwebui service")
