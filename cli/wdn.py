@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import mmap
 import os
 import re
 import shutil
@@ -2419,6 +2420,28 @@ SYSTEM_LIBS: dict[str, list[tuple[str, str, str, bool]]] = {
     ],
 }
 
+#: soname → (文件里的版本 banner 前缀, 最低可用版本, 低版本的后果)
+#:
+#: 有些系统库「装上了」不等于「能干活」—— 同一个库的不同版本**行为**不一样，
+#: 而且旧版本可能**静默**出错（不报错、只是结果不对）。这类库必须查版本，
+#: 光看「文件在不在 / apt 装没装」是不够的。
+#:
+#: ``librknnrt.so`` 就是一个：2.3.2 的 normalize 算子只接受 **NHWC** 源布局，
+#: 而 cshim 按模型声明的布局喂输入 ⇒ runtime 内部报错、但 ``rknn_inputs_set``
+#: 仍返回 0 ⇒ VAE 解码「成功」地输出一张废图（实测：整张棕黄色纹理，
+#: 灰度 std 6.6、边缘密度 0.0016；换成 2.5.0 后灰度 std 52.7、边缘密度 0.023）。
+#:
+#: ⇒ 版本必须查，而且要**说清后果**，否则用户只看到「一张奇怪的图」。
+SYSTEM_LIB_MIN_VERSION: dict[str, tuple[str, str, str]] = {
+    "librknnrt.so": (
+        "librknnrt version:",
+        "2.5.0",
+        "低于 2.5.0 的 runtime 不支持 NCHW 源的 normalize 算子 ⇒ "
+        "图片生成卡的 VAE 解码会静默出一张废图（worker 日志里有一行 "
+        "'rknn_inputs_set, normalize error(-1)'，但 runtime 仍返回 0，不报错）",
+    ),
+}
+
 # The C shims that are compiled from the sources at install time (they are
 # gitignored build artifacts — a fresh clone has none of them):
 #   package → {shim: (mandatory, remedy)}
@@ -2536,6 +2559,35 @@ def _real_path(p: Path) -> Path:
         return p
 
 
+def _lib_banner_version(path: Path, prefix: str) -> str:
+    """The version a native library reports in its own banner string.
+
+    Read it out of the **file**, not by dlopen'ing it: dlopen'ing the NPU
+    runtime would initialise the NPU driver, and a health check must not
+    touch the hardware of a live session (same reason as ``_unresolved_deps``).
+    A missing file / an unreadable one is not an error — the version is then
+    simply unknown.
+    """
+    pat = re.compile(re.escape(prefix.encode()) + rb"\s*([0-9]+(?:\.[0-9]+)*)")
+    try:
+        with open(path, "rb") as f:
+            with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                m = pat.search(mm)
+                return m.group(1).decode() if m else ""
+    except (OSError, ValueError):
+        return ""
+
+
+def _version_tuple(v: str) -> tuple[int, ...]:
+    """``"2.5.0"`` → ``(2, 5, 0)`` — comparable with ``<``."""
+    out: list[int] = []
+    for part in v.split("."):
+        if not part.isdigit():
+            break
+        out.append(int(part))
+    return tuple(out)
+
+
 def _check_hardware_libs(pkgs: list[tuple[str, str]]) -> int:
     """The system libraries the SDKs load at runtime."""
     problems = 0
@@ -2567,6 +2619,20 @@ def _check_hardware_libs(pkgs: list[tuple[str, str]]) -> int:
 
         ver = versions.get(apt_pkg, "")
         tail = f"  ({apt_pkg} {ver})" if ver else f"  (not from {apt_pkg})"
+
+        # ── 版本下限（见 SYSTEM_LIB_MIN_VERSION）─────────────────────────
+        # 有些库「装上了」≠「能干活」，而且旧版本是**静默**出错 ⇒ 必须查
+        # 库自己的版本，并把「低版本会怎样」说清楚。
+        minver = SYSTEM_LIB_MIN_VERSION.get(soname)
+        rt_ver = ""
+        too_old = False
+        if minver:
+            banner, minimum, _why = minver
+            rt_ver = _lib_banner_version(found, banner)
+            if rt_ver:
+                tail += f", runtime {rt_ver}"
+                too_old = _version_tuple(rt_ver) < _version_tuple(minimum)
+
         unresolved = _unresolved_deps(found)
         if unresolved:
             bad(f"{label} → {_real_path(found)}{tail}")
@@ -2575,6 +2641,18 @@ def _check_hardware_libs(pkgs: list[tuple[str, str]]) -> int:
             for m in unresolved:
                 note(f"  {m}")
             problems += 1
+        elif too_old:
+            # 警告而不是错误：库在、服务能起、别的功能也能用 —— 只有这一个
+            # 功能会静默出错 ⇒ 报成「错误」会让人以为整块板子坏了。
+            warn(f"{label} → {_real_path(found)}{tail}")
+            note(f"  the rknn2 runtime is {rt_ver}, but {minver[1]} or newer is required:")
+            note(f"  {minver[2]}")
+            note(f"  fix it: install rknn2-runtime {minver[1]} "
+                 f"(e.g. sudo dpkg -i rknn2-runtime_{minver[1]}-1_arm64.deb)")
+        elif minver and not rt_ver:
+            warn(f"{label} → {_real_path(found)}{tail}")
+            note(f"  the runtime version could not be read from the file — "
+                 f"check that it is {minver[1]} or newer")
         elif not ver:
             warn(f"{label} → {_real_path(found)}{tail}")
         else:
